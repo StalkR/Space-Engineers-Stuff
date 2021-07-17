@@ -96,11 +96,11 @@ def cubemap_3D_to_2D(face, x, y, z, r):
   # rotate
   x, y = {
     "left":  (-z, -y),
-    "right": ( z, -y),
+    "right": (-z,  y),
     "up":    (-x, -z),
-    "down":  ( x, -z),
+    "down":  (-x,  z),
     "back":  ( x, -y),
-    "front": (-x, -y),
+    "front": ( x,  y),
   }[face]
   # then translate from [-r, r] to [0, 2r]
   return round(x + r), round(y + r)
@@ -167,9 +167,10 @@ def find_face(vector3D, r):
     faces["back"] = L*x/length, L*y/length, r
     faces["front"] = L*x/length, L*y/length, -r
 
-  for face, (x, y, z) in faces.items():
-    if -r <= x <= r and -r <= y <= r and -r <= z <= r:
-      return face, cubemap_3D_to_2D(face, x, y, z, r)
+  for face, (a, b, c) in faces.items():
+    # dot product is positive if two vectors have same direction
+    if -r <= a <= r and -r <= b <= r and -r <= c <= r and a*x + b*y + c*z >= 0:
+      return face, cubemap_3D_to_2D(face, a, b, c, r)
 
   raise AssertionError("invalid GPS")
 
@@ -189,15 +190,21 @@ def world_to_point(point3D):
 # print("GPS:%s position:%f:%f:%f:#FF0000FF:" % (planet, *planet_position))
 # print("GPS:%s center:%f:%f:%f:#FFFF00FF:" % (planet, *center))
 
-# test points to visualize cubemap faces and orientation
+# test points to visualize cubemap faces and orientation, and verify roundtrip point-gps-point
 # for face, (a, b) in CUBE.items():
 #   p = a*size + 512, b*size + 512
-#   print("GPS:%s (face %s, top-left):%f:%f:%f:#FFFF0000:" % (planet, face, *point_to_world(p)))
+#   gps = point_to_world(p)
+#   print("[%i, %i] -> GPS:%s (face %s, top-left):%f:%f:%f:#FFFF0000:" % (*p, planet, face, *gps))
+#   assert world_to_point(gps) == p
 #   p = a*size + 1024, b*size + 1024
-#   print("GPS:%s (face %s):%f:%f:%f:#FFFF0000:" % (planet, face, *point_to_world(p)))
+#   gps = point_to_world(p)
+#   print("[%i, %i] -> GPS:%s (face %s):%f:%f:%f:#FFFF0000:" % (*p, planet, face, *gps))
+#   assert world_to_point(gps) == p
 
 if len(arg) == 2:
-  print("GPS:%s point:%f:%f:%f:#FF0000FF:" % (planet, *point_to_world(arg)))
+  gps = point_to_world(arg)
+  print("GPS:%s point:%f:%f:%f:#FF0000FF:" % (planet, *gps))
+  assert world_to_point(gps) == arg
   raise SystemExit
 
 print("GPS is at [%i, %i]" % world_to_point(arg))
