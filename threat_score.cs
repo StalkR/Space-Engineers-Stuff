@@ -17,7 +17,14 @@ Modular Encounters Spawner mod: https://steamcommunity.com/workshop/filedetails/
 */
 
 // Calculate the threat score of the current grid and connected grids (true), or only the current grid (false).
-bool multiGrid = true;
+bool multiGrid = false;
+
+// If you get "error: Script execution terminated, script is too complex" it's because the grid is too large for
+// counting all the non-terminal blocks, because unfortunately the game doesn't expose them (see below).
+// In that case:
+//  - switch to `multiGrid = false` above
+//  - open the 'info' tab for the grid and write the total number of blocks below
+int totalBlocks = 0;
 
 public Program() {
     Runtime.UpdateFrequency = UpdateFrequency.Once;
@@ -161,7 +168,7 @@ private void threatScoreSingleGrid() {
     float cargo = blocksThreat<IMyCargoContainer>(b => 0.5f);
     float antenna = blocksThreat<IMyRadioAntenna>(b => 4);
     float beacon = blocksThreat<IMyBeacon>(b => isMod(b) ? 6 : 3);
-    float blocks = (float)countBlocks() / 100;
+    float blocks = (float)(totalBlocks > 0 ? totalBlocks : countBlocks()) / 100;
     float multiplier = Me.CubeGrid.GridSizeEnum == MyCubeSize.Large ? 2.5f : 0.5f;
     float score = (power + weapons + production + tools + thrusters + cargo + antenna + beacon + blocks) * multiplier;
 
