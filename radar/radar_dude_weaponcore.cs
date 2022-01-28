@@ -1,17 +1,15 @@
 /*
  * Based off of whips radar for the lcd stuff, modified to work with weapon core by dude.
  * 
- * version 1.2
+ * version 1.3
  * 
- * NEW: Now will display the target list on multiple LCD's. Soon I'll add support for multiple lcds to show targets that overflow from the first screen.
- * NEW: Toggle on/off the radar showing asteroids and planets. Edit the option in the custom data of this PB to change. (experimental)
- * Attempt to fix allied grids not showing, let me know if it works ;)
+ * NEW: Ships that are targeting you will be colored yellow.
  * 
  * To see the radar screen, name an LCD 'Radar'
  * To see a list of nearby targets, name an LCD 'Target LCD'
  * To have lights and/or sound blocks trigger when an enemy is around, add 'alert' to their name.
  * Will show targets around you up to your current max weapon range. 
- * Make sure to set the range of the radar display accordingly either by changing the value in the custom data of this PB, or using the range # argument.
+ * To adjust the visible range of the radar display, use the 'range ##' (in meters) argument. Default is 10km. (Example argument: range 10000 )
  */
 
 
@@ -327,6 +325,10 @@ void GetTurretTargets()
                 targetElevationColor = enemyElevationColor;
                 relation = RadarSurface.Relation.Hostile;
                 enemyNearby = true;
+                if (Me.CubeGrid.EntityId == wcapi.GetAiFocus(targetData.Info.EntityId, 0).GetValueOrDefault().EntityId)
+                {
+                    targetIconColor = Color.Yellow;
+                }
                 break;
 
             case MyRelationsBetweenPlayerAndBlock.Owner:
@@ -498,6 +500,7 @@ class RadarSurface
         public int ThreatScore;
         public MyDetectedEntityType Type;
         public string Name;
+        public bool TargetingMe;
     }
 
     public RadarSurface(Color titleBarColor, Color backColor, Color lineColor, Color planeColor, Color textColor, Color targetLockColor, float projectionAngleDeg, float range, bool drawQuadrants)
