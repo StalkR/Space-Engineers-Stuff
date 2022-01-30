@@ -6,12 +6,17 @@ import (
   "net"
 )
 
-type Server struct {
-  aggregator *Aggregator
+type ServerData interface {
+  Info() *ServerInfo
+  Players() ServerPlayers
 }
 
-func NewServer(a *Aggregator) *Server {
-  return &Server{aggregator: a}
+type Server struct {
+  data ServerData
+}
+
+func NewServer(data ServerData) *Server {
+  return &Server{data: data}
 }
 
 func (s *Server) ListenAndServe(addr string) error {
@@ -49,13 +54,13 @@ func (s *Server) handle(conn net.PacketConn) error {
     if payload != A2S_INFO_PAYLOAD {
       return fmt.Errorf("invalid payload: got %v want %v", payload, A2S_INFO_PAYLOAD)
     }
-    if _, err := conn.WriteTo(s.aggregator.Info().Bytes(), addr); err != nil {
+    if _, err := conn.WriteTo(s.data.Info().Bytes(), addr); err != nil {
       return fmt.Errorf("write info: %v", err)
     }
     return nil
 
   case A2S_PLAYER:
-    if _, err := conn.WriteTo(s.aggregator.Players().Bytes(), addr); err != nil {
+    if _, err := conn.WriteTo(s.data.Players().Bytes(), addr); err != nil {
       return fmt.Errorf("write players: %v", err)
     }
     return nil
