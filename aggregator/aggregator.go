@@ -25,9 +25,10 @@ func (s *Aggregator) Aggregate() {
 		for server := range s.infos {
 			info, err := queryInfo(server)
 			if err != nil {
-				log.Printf("Query %v error: %v", server, err)
+				log.Printf("query %v error: %v", server, err)
 				continue
 			}
+			log.Printf("querying %v: %v players", server, info.Players)
 			s.m.Lock()
 			s.infos[server] = info
 			s.m.Unlock()
