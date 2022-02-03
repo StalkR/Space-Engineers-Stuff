@@ -1,0 +1,891 @@
+/*
+ * R e a d m e
+ * -----------
+ * 
+ * In this file you can include any instructions or other comments you want to have injected onto the 
+ * top of your final script. You can safely delete this file if you do not want any such comments.
+ */
+
+public static WcPbApi myWcApi;
+public static PbApiWrapper myShieldApi { get; private set; }
+//Controllers
+double X_kp, X_ki, X_kd2, X_kd; //X pointing controller
+double Y_kp, Y_ki, Y_kd2, Y_kd; //Y pointing controller
+double Z_kp, Z_ki, Z_kd2, Z_kd; //Z pointing controller
+double A_kp, A_ki, A_kd2, A_kd; //Angle hold controller
+double C_kp, C_ki, C_kd2, C_kd; //Center distance controller
+double R_kp, R_ki, R_kd2, R_kd; //Range hold controller
+Controller ConX, ConY, ConZ, ConA, ConC, ConR;
+//Parts Manefest
+List<IMyGyro> gyros;
+List<IMyThrust> thrusters;
+List<IMyCameraBlock> cameras;
+List<IMyTerminalBlock> weapons;
+List<IMyTimerBlock> timers;
+//Settings
+double engageRange;
+double maxCD;
+bool runFlag;
+bool startPermission = false;
+int count;
+double throttle;
+double zoneTime;
+double countDown;
+double startCD;
+bool verbose;
+int obstacleAvoidenceCooldown;
+string channel;
+DroneCommsObject comms;
+double launchCountDown;
+//World Data
+Vector3D arenaCenterWF;
+Vector3D arenaCenterGF;
+//My Data
+Vector3D myVelocityGF;
+Vector3D myVelocityWF;
+Vector3D lastPosition;
+double mySpeed = 0;
+int droneSerialNumber;
+Vector3D myGyroRpms = new Vector3D();
+//Target Data
+MyDetectedEntityInfo currentTarget;
+Vector3D nmeVectorGF;
+//Target Choice Gains
+double targetRange;
+double targetThreat;
+double targetCenterDistance;
+double targetSize;
+bool hiveMind;
+
+public Program()
+{
+    //Run once
+    myWcApi = new WcPbApi();
+    myWcApi.Activate(Me);
+    myShieldApi = new PbApiWrapper(Me);
+    Runtime.UpdateFrequency = UpdateFrequency.Update1;
+
+    var customData = Me.CustomData;
+    MyIni _ini = new MyIni();
+    MyIniParseResult result;
+    if (!_ini.TryParse(Me.CustomData, out result))
+        throw new Exception(result.ToString());
+    channel = _ini.Get("Settings", "channel").ToString();
+    runFlag = false;
+    startPermission = false;
+    comms = new DroneCommsObject(channel, IGC);
+
+}
+
+public void Config()
+{
+    var customData = Me.CustomData;
+    MyIni _ini = new MyIni();
+    MyIniParseResult result;
+    if (!_ini.TryParse(Me.CustomData, out result))
+        throw new Exception(result.ToString());
+    X_kp = _ini.Get("Gains", "X_kp").ToDouble(); //X pointing controller
+    X_ki = _ini.Get("Gains", "X_ki").ToDouble(); //X pointing controller
+    X_kd2 = _ini.Get("Gains", "X_kd2").ToDouble(); //X pointing controller
+    X_kd = _ini.Get("Gains", "X_kd").ToDouble(); //X pointing controller
+    Y_kp = _ini.Get("Gains", "Y_kp").ToDouble(); //Y pointing controller
+    Y_ki = _ini.Get("Gains", "Y_ki").ToDouble(); //Y pointing controller
+    Y_kd2 = _ini.Get("Gains", "Y_kd2").ToDouble(); //Y pointing controller
+    Y_kd = _ini.Get("Gains", "Y_kd").ToDouble(); //Y pointing controller
+    Z_kp = _ini.Get("Gains", "Z_kp").ToDouble(); //Z pointing controller
+    Z_ki = _ini.Get("Gains", "Z_ki").ToDouble(); //Z pointing controller
+    Z_kd2 = _ini.Get("Gains", "Z_kd2").ToDouble(); //Z pointing controller
+    Z_kd = _ini.Get("Gains", "Z_kd").ToDouble(); //Z pointing controller
+    A_kp = _ini.Get("Gains", "A_kp").ToDouble(); //Angle hold controller
+    A_ki = _ini.Get("Gains", "A_ki").ToDouble(); //Angle hold controller
+    A_kd2 = _ini.Get("Gains", "A_kd2").ToDouble(); //Angle hold controller
+    A_kd = _ini.Get("Gains", "A_kd").ToDouble(); //Angle hold controller
+    C_kp = _ini.Get("Gains", "C_kp").ToDouble(); //Center distance controller
+    C_ki = _ini.Get("Gains", "C_ki").ToDouble(); //Center distance controller
+    C_kd2 = _ini.Get("Gains", "C_kd2").ToDouble(); //Center distance controller
+    C_kd = _ini.Get("Gains", "C_kd").ToDouble(); //Center distance controller
+    R_kp = _ini.Get("Gains", "R_kp").ToDouble(); //Range hold controller
+    R_ki = _ini.Get("Gains", "R_ki").ToDouble(); //Range hold controller
+    R_kd2 = _ini.Get("Gains", "R_kd2").ToDouble(); //Range hold controller
+    R_kd = _ini.Get("Gains", "R_kd").ToDouble(); //Range hold controller
+    engageRange = _ini.Get("Settings", "engageRange").ToDouble();
+    maxCD = _ini.Get("Settings", "maxCD").ToDouble();
+    throttle = _ini.Get("Settings", "throttle").ToDouble();
+    droneSerialNumber = _ini.Get("Settings", "droneSerialNumber").ToInt32();
+    zoneTime = _ini.Get("Settings", "zoneTime").ToDouble();
+    verbose = _ini.Get("Settings", "verbose").ToBoolean();
+    double centerX = _ini.Get("Center GPS", "centerX").ToDouble();
+    double centerY = _ini.Get("Center GPS", "centerY").ToDouble();
+    double centerZ = _ini.Get("Center GPS", "centerZ").ToDouble();
+    arenaCenterWF = new Vector3D(centerX, centerY, centerZ);
+    targetCenterDistance = _ini.Get("Target Choice", "targetCenterDistance").ToDouble();
+    targetRange = _ini.Get("Target Choice", "targetRange").ToDouble();
+    targetThreat = _ini.Get("Target Choice", "targetThreat").ToDouble();
+    targetSize = _ini.Get("Target Choice", "targetSize").ToDouble();
+    hiveMind = _ini.Get("Target Choice", "hiveMind").ToBoolean();
+    count = 0;
+    gyros = new List<IMyGyro>();
+    thrusters = new List<IMyThrust>();
+    weapons = new List<IMyTerminalBlock>();
+    timers = new List<IMyTimerBlock>();
+
+    comms = new DroneCommsObject(channel, IGC);
+
+    ConX = new Controller(X_kp, X_ki, X_kd2, X_kd, MathHelper.ToRadians(10));
+    ConY = new Controller(Y_kp, Y_ki, Y_kd2, Y_kd, MathHelper.ToRadians(10));
+    ConZ = new Controller(Z_kp, Z_ki, Z_kd2, Z_kd, MathHelper.ToRadians(10));
+    ConA = new Controller(A_kp, A_ki, A_kd2, A_kd, 1500);
+    ConC = new Controller(C_kp, C_ki, C_kd2, C_kd, 1500);
+    ConR = new Controller(R_kp, R_ki, R_kd2, R_kd, 1500);
+    FindMyParts();
+    _ini.Clear();
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if (runFlag)
+    {
+        FindSelfInfo();
+        FindTarget();
+        UpdateZoneTime(ref countDown);
+        //AssessShields();
+        if (verbose)
+        {
+            Echo("Current Target: " + currentTarget.Name);
+            Echo("Current Engagement Range: \n" + ((float)engageRange).ToString());
+            Echo("Current Adjusted Throttle: \n" + ((float)throttle).ToString());
+            Echo("Avoidence Cooldown: \n" + obstacleAvoidenceCooldown.ToString());
+            Echo("Current Adjusted Center Distance: \n" + ((float)maxCD).ToString());
+            //Echo("Gyros Detected: " + gyros.Count());
+            Echo("Camera Forward: : " + cameras.First().Orientation.Forward.ToString());
+            Echo("Camera Up: : " + cameras.First().Orientation.Up.ToString());
+        }
+        Matrix orientationMatrix = cameras.First().WorldMatrix;
+        //throttle here
+        foreach (IMyThrust thrust in thrusters) { thrust.ThrustOverridePercentage = (float)throttle; }
+        if (count % 4 == 0) { RunX(); }
+        else if (count % 4 == 1) { RunY(); }
+        else if (count % 4 == 2) { RunZ(); }
+        else if (count == 3) { currentTarget = PickTarget(); }
+        else if (count == 7) { AssignTarget(); ApplyGyroOverride(myGyroRpms, orientationMatrix); }
+        else if (count == 11) { AvoidObstacles(); ApplyGyroOverride(myGyroRpms, orientationMatrix); }
+        else if (count == 15) { AssessDamage(); ApplyGyroOverride(myGyroRpms, orientationMatrix); }
+        else if (count == 19) { HandleTimers(); ApplyGyroOverride(myGyroRpms, orientationMatrix); }
+        count++;
+        if (count >= 20) { count = 0; }
+    }
+    else
+    {
+        //Script runs when it gets the Go signal on the proper channel
+        //Generate a random time delay so the drones don't all launch at once.
+        Echo("Drone standing by.");
+        Echo(startPermission.ToString());
+        Echo("Launch in : \n" + launchCountDown + " seconds");
+        string message = comms.RecieveMessages();
+        comms.ClearMessages();
+        Echo(message);
+        if (message == "Begin" && !runFlag && !startPermission)
+        {
+            Config();
+            AutoRename();
+            Random myRand = new Random((int)Me.EntityId);
+            launchCountDown = myRand.Next(1, 20);
+            startPermission = true;
+            startCD = maxCD;
+            countDown = zoneTime;
+        }
+        else if (argument != "" && argument is string && !runFlag && !startPermission)
+        {
+            comms.SendMessage(argument);
+            Config();
+            AutoRename();
+            Random myRand = new Random((int)Me.EntityId);
+            launchCountDown = myRand.Next(2, 20);
+            startPermission = true;
+            startCD = maxCD;
+            countDown = zoneTime;
+        }
+        if (startPermission && launchCountDown > 0 && !runFlag)
+        {
+            launchCountDown -= 1.0 / 60.0;
+        }
+        else if (startPermission && launchCountDown < 0 && !runFlag) { runFlag = true; }
+    }
+}
+
+public void RunX()
+{
+    if (mySpeed > 10)
+    {
+        //Handle target range
+        //Get hold factor for target range
+        //double rangeErrorPercent = nmeVectorGF.Length() / engageRange - 1;
+        double rangeError = nmeVectorGF.Length() - engageRange;
+        //rangeError = Math.Pow(rangeError, 3);
+        double rangeHoldFactor = MathHelper.ToRadians(ConR.Run(rangeError));
+        //Get hold factor for center distance
+        double cdErrorRatio = arenaCenterGF.Length() / maxCD;
+        if (cdErrorRatio < 0) { cdErrorRatio = 1000000; }
+        if (arenaCenterGF.Length() > (maxCD + 500)) { cdErrorRatio = 10000; }
+        double cdHoldFactor = MathHelper.ToRadians(ConC.Run(cdErrorRatio));
+        cdErrorRatio = Math.Pow(Math.E, cdErrorRatio);
+        //if dodging an obstacle point up
+        Vector3D dodge = new Vector3D(0, 0, 0);
+        if (obstacleAvoidenceCooldown != 0)
+        {
+            dodge = Vector3D.Normalize(Vector3D.Cross(nmeVectorGF, myVelocityGF));
+        }
+        //Get the setpoint vector
+        Vector3D spVector = Vector3D.Normalize(nmeVectorGF) * rangeHoldFactor + Vector3D.Normalize(arenaCenterGF) * cdHoldFactor + Vector3D.Normalize(myVelocityGF) + dodge * obstacleAvoidenceCooldown;
+        spVector = Vector3D.Normalize(spVector);
+        //get the hold angle and clamp to +-90
+        double spErrorAngle = MathHelper.ToRadians(ConA.Run(GetAngle(myVelocityGF, spVector)));
+        if (spErrorAngle > MathHelper.ToRadians(120)) { spErrorAngle = MathHelper.ToRadians(120); }
+        if (spErrorAngle < -MathHelper.ToRadians(120)) { spErrorAngle = -MathHelper.ToRadians(120); }
+        //rotate from velocity vector towards spvector to get final hold vector
+        Vector3D axis = Vector3D.Cross(Vector3D.Normalize(myVelocityGF), Vector3D.Normalize(spVector));
+        MatrixD rotate = MatrixD.CreateFromAxisAngle(axis, spErrorAngle);
+        Vector3D finalHold = Vector3D.Rotate(myVelocityGF, rotate);
+        //run the pointing controller
+        myGyroRpms.X = ConX.Run(Math.Asin(Vector3D.Normalize(finalHold).Y / finalHold.Length()));
+    }
+    else
+    {
+        myGyroRpms.X = ConX.Run(Math.Asin(nmeVectorGF.X / nmeVectorGF.Length()));
+    }
+}
+
+public void RunY()
+{
+    if (mySpeed > 10)
+    {
+        //Handle target range
+        //Get hold factor for target range
+        //double rangeErrorPercent = nmeVectorGF.Length() / engageRange - 1;
+        double rangeError = nmeVectorGF.Length() - engageRange;
+        //rangeError = Math.Pow(rangeError, 3);
+        double rangeHoldFactor = MathHelper.ToRadians(ConR.Run(rangeError));
+        //Get hold factor for center distance
+        double cdErrorRatio = arenaCenterGF.Length() / maxCD;
+        cdErrorRatio = Math.Pow(Math.E, cdErrorRatio);
+        if (cdErrorRatio < 0) { cdErrorRatio = 1000000; }
+        if (arenaCenterGF.Length() > (maxCD + 500)) { cdErrorRatio = 10000; }
+        double cdHoldFactor = MathHelper.ToRadians(ConC.Run(cdErrorRatio));
+        //if dodging an obstacle point up
+        Vector3D dodge = new Vector3D(0, 0, 0);
+        if (obstacleAvoidenceCooldown != 0)
+        {
+            dodge = Vector3D.Normalize(Vector3D.Cross(nmeVectorGF, myVelocityGF));
+        }
+        //Get the setpoint vector
+        Vector3D spVector = Vector3D.Normalize(nmeVectorGF) * rangeHoldFactor + Vector3D.Normalize(arenaCenterGF) * cdHoldFactor + Vector3D.Normalize(myVelocityGF) + dodge * obstacleAvoidenceCooldown;
+        spVector = Vector3D.Normalize(spVector);
+        //get the hold angle and clamp to +-90
+        double spErrorAngle = MathHelper.ToRadians(ConA.Run(GetAngle(myVelocityGF, spVector)));
+        if (spErrorAngle > MathHelper.ToRadians(120)) { spErrorAngle = MathHelper.ToRadians(120); }
+        if (spErrorAngle < -MathHelper.ToRadians(120)) { spErrorAngle = -MathHelper.ToRadians(120); }
+        //rotate from velocity vector towards spvector to get final hold vector
+        Vector3D axis = Vector3D.Cross(Vector3D.Normalize(myVelocityGF), Vector3D.Normalize(spVector));
+        MatrixD rotate = MatrixD.CreateFromAxisAngle(axis, spErrorAngle);
+        Vector3D finalHold = Vector3D.Rotate(myVelocityGF, rotate);
+        //run the pointing controller
+        myGyroRpms.Y = ConY.Run(Math.Asin(Vector3D.Normalize(finalHold).X / finalHold.Length()));
+    }
+    else
+    {
+        myGyroRpms.Y = ConY.Run(Math.Asin(nmeVectorGF.Y / nmeVectorGF.Length()));
+    }
+}
+
+public void RunZ()
+{
+    Vector3D intercept = nmeVectorGF;
+    double angle = GetAngle(nmeVectorGF, Vector3D.Forward);
+    if (angle > MathHelper.ToRadians(20) && angle < MathHelper.ToRadians(160)) //This check prevents singularities from occuring when pointing close to the enemies vector. Just don't need to roll if you point at the enemy.
+    {
+        //Try to find the poitning vector for the highest dps turret. If not return the enemy position.
+        try
+        {
+            IMyTerminalBlock highestDpsWep = weapons.First();
+            Dictionary<string, int> mainWepMap = new Dictionary<string, int>();
+            double maxDps = 0;
+            foreach (IMyTerminalBlock weapon in weapons)
+            {
+                double thisDps = myWcApi.GetOptimalDps(weapon.EntityId);
+                if (thisDps > maxDps) { highestDpsWep = weapon; maxDps = thisDps; }
+            }
+            myWcApi.GetBlockWeaponMap(highestDpsWep, mainWepMap);
+            intercept = (Vector3D)myWcApi.GetPredictedTargetPosition(highestDpsWep, currentTarget.EntityId, mainWepMap.First().Value);
+            intercept = FrameHelpers.ConvertPosToGridFrame(intercept, cameras.First());
+            mainWepMap.Clear();
+        }
+        catch (Exception e) { }
+        //this works don't mess with it
+        double theta = Math.Atan(intercept.X / intercept.Y);
+        if (theta > 0)
+        {
+            myGyroRpms.Z = ConZ.Run(theta - 1.57);
+        }
+        else
+        {
+            myGyroRpms.Z = ConZ.Run(theta + 1.57);
+        }
+    }
+    else { myGyroRpms.Z = 0; }
+}
+
+public double GetAngle(Vector3D v, Vector3D w)
+{
+    try
+    {
+        //atan2(dot(cross(n,v), w), dot(v,w));
+        v = Vector3D.Normalize(v);
+        w = Vector3D.Normalize(w);
+        Vector3D n = Vector3D.Cross(v, w);
+        n = Vector3D.Normalize(n);
+        return Math.Atan2(Vector3D.Dot(Vector3D.Cross(n, v), w), Vector3D.Dot(v, w));
+    }
+    catch (Exception e)
+    {
+        return 0;
+    }
+}
+
+public void FindMyParts()
+{
+    //Get a list of cameras
+    cameras = new List<IMyCameraBlock>();
+    GridTerminalSystem.GetBlocksOfType(cameras);
+    var RCFwd = cameras.First().Orientation.Forward;
+    var RCUp = cameras.First().Orientation.Up;
+
+    //get a list of gyros
+    GridTerminalSystem.GetBlocksOfType(gyros);
+    if (gyros.Count() == 0) { Echo("No Gyros"); }
+
+    //Get a list of forward facing thrusters(rearward facing technically)
+    List<IMyThrust> _thrusters = new List<IMyThrust>();
+    GridTerminalSystem.GetBlocksOfType<IMyThrust>(_thrusters);
+    foreach (IMyThrust thruster in _thrusters)
+    {
+        if (thruster.Orientation.Forward == Base6Directions.GetOppositeDirection(RCFwd)) { thrusters.Add(thruster); };
+    }
+    if (thrusters.Count() == 0) { Echo("No Thrusters With Proper Orientation"); }
+
+    //Get a list of WC Weapons
+    List<MyDefinitionId> tempWeapons = new List<MyDefinitionId>();
+    myWcApi.GetAllCoreTurrets(tempWeapons);
+    List<string> definitionSubIds = new List<string>();
+    tempWeapons.ForEach(d => definitionSubIds.Add(d.SubtypeName));
+    GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(weapons, b => b.CubeGrid ==
+        Me.CubeGrid && definitionSubIds.Contains(b.BlockDefinition.SubtypeName));
+
+    //Get a list of Timer Blocks
+    try
+    {
+        IMyBlockGroup group = GridTerminalSystem.GetBlockGroupWithName("Drone Timers");
+        group.GetBlocksOfType(timers);
+    }
+    catch { }
+
+    tempWeapons.Clear();
+    _thrusters.Clear();
+}
+
+public void FindSelfInfo()
+{
+    //Vector3D myVelWF = controllers.First().GetShipVelocities().LinearVelocity;
+    GetVelocityVector(cameras.First());
+    myVelocityGF = FrameHelpers.ConvertDirToGridFrame(myVelocityWF, cameras.First());
+    arenaCenterGF = FrameHelpers.ConvertPosToGridFrame(arenaCenterWF, cameras.First());
+}
+
+public void UpdateZoneTime(ref double _counter)
+{
+    double zoneSizeRatio = _counter / zoneTime;
+    maxCD = startCD * zoneSizeRatio;
+    if (engageRange > maxCD) { engageRange = maxCD; }
+    if (_counter > 1) { _counter = _counter - (1.0 / 60.0); }
+    if (_counter < 1 && _counter != 0)
+    {
+        _counter = 0;
+        ConX.Reset(); ConY.Reset(); ConZ.Reset();
+        ConA.Reset(); ConC.Reset(); ConR.Reset();
+    }
+}
+
+public MyDetectedEntityInfo PickTarget()
+{
+    //get the entity info of the weakest target
+    Dictionary<MyDetectedEntityInfo, float> targetList = new Dictionary<MyDetectedEntityInfo, float>();
+    myWcApi.GetSortedThreats(Me, targetList);
+    Dictionary<MyDetectedEntityInfo, float> enemyList = new Dictionary<MyDetectedEntityInfo, float>();
+    foreach (var target in targetList)
+    {
+        double targetCD = (target.Key.Position - arenaCenterWF).Length();
+        if (!target.Key.Relationship.IsFriendly() && targetCD < maxCD + 1500) { enemyList.Add(target.Key, target.Value); }
+    }
+    if (enemyList.Count == 0)
+    {
+        enemyList.Clear();
+        targetList.Clear();
+        return new MyDetectedEntityInfo();
+    }
+    else
+    {
+        MyDetectedEntityInfo bestTarget = targetList.First().Key;
+        double bestTargeValue = 0;
+        foreach (var target in enemyList)
+        {
+            double targetValue = 0;
+            targetValue += target.Key.BoundingBox.Volume * targetSize;
+            targetValue += target.Value * targetThreat;
+            targetValue += FrameHelpers.ConvertPosToGridFrame(target.Key.Position, cameras.First()).Length() * targetRange;
+            targetValue += (target.Key.Position - arenaCenterWF).Length() * targetCenterDistance;
+            if (targetValue > bestTargeValue) { bestTargeValue = targetValue; bestTarget = target.Key; }
+        }
+        if (bestTarget.EntityId != currentTarget.EntityId)
+        {
+            ConX.Reset();
+            ConY.Reset();
+            ConZ.Reset();
+            ConA.Reset();
+            ConC.Reset();
+            ConR.Reset();
+        }
+        if (hiveMind)
+        {
+            comms.SendMessage(bestTarget.EntityId.ToString());
+            Dictionary<long, int> voteList = new Dictionary<long, int>();
+            voteList.Add(bestTarget.EntityId, 1);
+            comms.RecieveMessages();
+            foreach(var ballot in comms.Messages)
+            {
+                long thisVote;
+                long.TryParse(ballot, out thisVote);
+                if (voteList.ContainsKey(thisVote)) { voteList[thisVote] = voteList[thisVote] + 1; }
+                else { voteList.Add(thisVote, 1); }
+            }
+            comms.ClearMessages();
+            double winnerId = voteList.OrderByDescending(x => x.Value).First().Key;
+            voteList.Clear();
+            foreach (var enemy in enemyList)
+            {
+                if(enemy.Key.EntityId == winnerId)
+                {
+                    enemyList.Clear();
+                    targetList.Clear();
+                    return enemy.Key;
+                }
+            }
+            return bestTarget; //default if vote fails
+        }
+        else
+        {
+            enemyList.Clear();
+            targetList.Clear();
+            return bestTarget;
+        }
+    }
+}
+
+public void FindTarget()
+{
+    Dictionary<MyDetectedEntityInfo, float> targetList = new Dictionary<MyDetectedEntityInfo, float>();
+    myWcApi.GetSortedThreats(Me, targetList);
+    if (targetList.Count() == 0) { nmeVectorGF = arenaCenterGF; Echo("No target found, returning to center."); }
+    else
+    {
+        foreach (var target in targetList)
+        {
+            if (target.Key.EntityId == currentTarget.EntityId) { nmeVectorGF = FrameHelpers.ConvertPosToGridFrame(target.Key.Position, cameras.First()); }
+
+        }
+    }
+    targetList.Clear();
+}
+
+public void AssessDamage()
+{
+
+}
+
+/*
+        public void AssessShields()
+        {
+            float shieldHp = myShieldApi.GetShieldPercent();
+            if(shieldHp > 90.0) { adjustedRange = engageRange; }
+            if(shieldHp < 50.0) { adjustedRange = engageRange * 2.0; }
+            if (adjustedRange > maxCD - 1000.0) { adjustedRange = maxCD - 1000; }
+            double rangeError = nmeVectorGF.Length() - engageRange;
+            if (shieldHp < 90.0)
+            {
+                adjustedThrottle = throttle - throttle * (1.0 - shieldHp / 100.0);
+                if (adjustedThrottle > 1.0) { adjustedThrottle = 1; }
+                else if (adjustedThrottle < throttle / 2.0) { adjustedThrottle = throttle / 2.0; }
+            }
+            else
+            {
+                adjustedThrottle = throttle;
+            }
+            Echo("Shield HP% : " + shieldHp.ToString());
+        }*/
+
+public void AssignTarget()
+{
+    myWcApi.SetAiFocus(Me, currentTarget.EntityId, 0);
+    if (!currentTarget.IsEmpty())
+    {
+        //if there is a target in range set the launchers to shoot, otherwise turn them off so shots aren't wasted.
+        List<IMyTerminalBlock> launcherBlocks = new List<IMyTerminalBlock>();
+        List<MyDefinitionId> launcherIds = new List<MyDefinitionId>();
+        myWcApi.GetAllCoreStaticLaunchers(launcherIds);
+        List<string> definitionSubIds = new List<string>();
+        launcherIds.ForEach(d => definitionSubIds.Add(d.SubtypeName));
+        GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(launcherBlocks, b => b.CubeGrid ==
+            Me.CubeGrid && definitionSubIds.Contains(b.BlockDefinition.SubtypeName));
+        foreach (var weapon in launcherBlocks)
+        {
+            myWcApi.ToggleWeaponFire(weapon, true, true);
+        }
+        definitionSubIds.Clear();
+        launcherIds.Clear();
+        launcherBlocks.Clear();
+    }
+    else
+    {
+        List<IMyTerminalBlock> launcherBlocks = new List<IMyTerminalBlock>();
+        List<MyDefinitionId> launcherIds = new List<MyDefinitionId>();
+        myWcApi.GetAllCoreStaticLaunchers(launcherIds);
+        List<string> definitionSubIds = new List<string>();
+        launcherIds.ForEach(d => definitionSubIds.Add(d.SubtypeName));
+        GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(launcherBlocks, b => b.CubeGrid ==
+            Me.CubeGrid && definitionSubIds.Contains(b.BlockDefinition.SubtypeName));
+        foreach (var weapon in launcherBlocks)
+        {
+            myWcApi.ToggleWeaponFire(weapon, false, true);
+        }
+        definitionSubIds.Clear();
+        launcherIds.Clear();
+        launcherBlocks.Clear();
+    }
+}
+
+public void AutoRename()
+{
+    Me.CubeGrid.CustomName = Me.CustomName + " " + droneSerialNumber.ToString();
+}
+
+public void HandleTimers()
+{
+    if (timers != null && timers.Count != 0)
+    {
+        foreach (var timer in timers)
+        {
+            if (!timer.IsCountingDown) { timer.StartCountdown(); }
+        }
+    }
+}
+
+public void AvoidObstacles()
+{
+    if (obstacleAvoidenceCooldown > 0) { obstacleAvoidenceCooldown--; }
+    cameras.First().EnableRaycast = true;
+    if (cameras.First().CanScan(5000))
+    {
+        double angle = GetAngle(myVelocityGF, Vector3D.Zero);
+        MyDetectedEntityInfo hit = cameras.First().Raycast(5000, Vector3D.Forward);
+        if (hit.Type == MyDetectedEntityType.Asteroid || hit.Type == MyDetectedEntityType.LargeGrid) { obstacleAvoidenceCooldown += 20; }
+    }
+}
+/*
+        public void ApplyGyroOverride(Vector3D rotationVec, MatrixD controllerMatrix)
+        {
+            Whip's ApplyGyroOverride - Last modified: 2020/08/27
+            Takes pitch, yaw, and roll speeds relative to the gyro's backwards
+            ass rotation axes.
+            Modified by Velcro
+            var relativeRotationVec = Vector3D.TransformNormal(rotationVec, controllerMatrix);
+
+            foreach (var thisGyro in gyros)
+            {
+                var transformedRotationVec = Vector3D.TransformNormal(relativeRotationVec, Matrix.Transpose(thisGyro.WorldMatrix));
+
+                thisGyro.Yaw = (float)transformedRotationVec.X;
+                thisGyro.Pitch = (float)transformedRotationVec.Y;
+                thisGyro.Roll = (float)transformedRotationVec.Z;
+                thisGyro.GyroOverride = true;
+            }
+        }*/
+
+public void ApplyGyroOverride(Vector3D rotationVec, MatrixD controllerMatrix)
+{
+    //Whip's ApplyGyroOverride Method v9 - 8/19/17
+    // X : Pitch, Y : Yaw, Z : Roll
+    rotationVec.X = -rotationVec.X;
+    var _rotationVec = rotationVec; //because keen does some weird stuff with signs
+    var relativeRotationVec = Vector3D.TransformNormal(_rotationVec, controllerMatrix);
+
+    foreach (var thisGyro in gyros)
+    {
+        var transformedRotationVec = Vector3D.TransformNormal(relativeRotationVec, Matrix.Transpose(thisGyro.WorldMatrix));
+
+        thisGyro.Pitch = (float)transformedRotationVec.X;
+        thisGyro.Yaw = (float)transformedRotationVec.Y;
+        thisGyro.Roll = (float)transformedRotationVec.Z;
+        thisGyro.GyroOverride = true;
+    }
+}
+
+public void GetVelocityVector(IMyCameraBlock cblock)
+{
+    Vector3D thisPosition = cblock.WorldMatrix.Translation;
+    myVelocityWF = (thisPosition - lastPosition) * 60;
+    lastPosition = thisPosition;
+    mySpeed = myVelocityWF.Length();
+}
+
+}
+
+public class DroneCommsObject
+{
+    IMyIntergridCommunicationSystem _IGC;
+    string _broadcastTag = "";
+    public List<string> Messages = new List<string>();
+
+    public DroneCommsObject(string broadcastTag, IMyIntergridCommunicationSystem IGC) { _broadcastTag = broadcastTag; _IGC = IGC; }
+
+    public string RecieveMessages()
+    {
+        //from Malware / Wicorel: IGC-Example-1-Simple-Echo-Example
+        //update the list of messages, if the user only wants message 1 return that
+        IMyBroadcastListener _myBroadcastListener;
+        _myBroadcastListener = _IGC.RegisterBroadcastListener(_broadcastTag);
+        _myBroadcastListener.SetMessageCallback(_broadcastTag);
+        while (_myBroadcastListener.HasPendingMessage)
+        {
+            MyIGCMessage myIGCMessage = _myBroadcastListener.AcceptMessage();
+            if (myIGCMessage.Tag == _broadcastTag)
+            { // This is our tag
+                if (myIGCMessage.Data is string)
+                {
+                    if (myIGCMessage.Data.ToString() != "") { Messages.Add(myIGCMessage.Data.ToString()); }
+                }
+            }
+        }
+        if(Messages.Count > 0) { return Messages.First(); }
+        else { return ""; }
+    }
+
+    public void SendMessage(string _message)
+    {
+        //from Malware / Wicorel: IGC-Example-1-Simple-Echo-Example
+        if (_message != "")
+        {
+            _IGC.SendBroadcastMessage(_broadcastTag, _message);
+        }
+    }
+
+    public void ClearMessages()
+    {
+        Messages.Clear();
+    }
+}
+
+
+public static class FrameHelpers
+{
+    public static Vector3D ConvertPosToGridFrame(Vector3D inVector, IMyCameraBlock cBlock)
+    {
+        Vector3D referenceWorldPosition = cBlock.WorldMatrix.Translation; // block.WorldMatrix.Translation is the same as block.GetPosition() btw
+
+        // Convert worldPosition into a world direction
+        Vector3D worldDirection = inVector - referenceWorldPosition; // This is a vector starting at the reference block pointing at your desired position
+
+        // Convert worldDirection into a local direction
+        return Vector3D.TransformNormal(worldDirection, MatrixD.Transpose(cBlock.WorldMatrix)); // Note that we transpose to go from world -> body
+    }
+    public static Vector3D ConvertDirToGridFrame(Vector3D inVector, IMyCameraBlock cBlock)
+    {
+        IMyTerminalBlock referenceBlock = cBlock;
+
+        // Convert worldDirection into a local direction
+        Vector3D bodyVector = Vector3D.TransformNormal(inVector, MatrixD.Transpose(referenceBlock.WorldMatrix)); // Note that we transpose to go from world -> body
+        return bodyVector;
+    }
+}
+
+
+public class Controller
+{
+    double _kp, _ki, _kd2, _kd, _last2, last, _iClampThreshold, acc;
+    public Controller(double kp, double ki, double kd2, double kd, double iClampThreshold)
+    {
+        _kp = kp;
+        _ki = ki;
+        _kd = kd;
+        _kd2 = kd2;
+        _last2 = 0;
+        last = 0;
+        acc = 0;
+        _iClampThreshold = iClampThreshold;
+    }
+
+    public double Run(double error)
+    {
+        double output = 0.0;
+        output += Proportional(error);
+        output += Derivative2(error);
+        output += Derivative(error);
+        return output;
+    }
+
+    public double Proportional(double error)
+    {
+        return error * _kp;
+    }
+
+    public double Integral(double error)
+    {
+        if (_ki != 0)
+        {
+            acc += error;
+            double integral = acc * _ki;
+            if ((error > _iClampThreshold || error < -_iClampThreshold) && _iClampThreshold != 0) { acc -= error; }
+            if (_ki > _iClampThreshold * 2) { acc = 0; }
+            return integral;
+        }
+        return 0;
+    }
+
+    public double Derivative2(double error)
+    {
+        double derivative2 = (last - _last2) * _kd2;
+        _last2 = last;
+        return derivative2;
+    }
+
+    public double Derivative(double error)
+    {
+        double derivative = (error - last) * _kd;
+        last = error;
+        return derivative;
+    }
+
+    public void Reset()
+    {
+        acc = 0;
+        last = 0;
+        _last2 = 0;
+    }
+}
+
+
+/// <summary>
+    /// https://github.com/sstixrud/WeaponCore/blob/master/Data/Scripts/WeaponCore/Api/WeaponCorePbApi.cs
+    /// </summary>
+public class WcPbApi
+{
+    private Action<ICollection<MyDefinitionId>> _getCoreStaticLaunchers;
+    private Action<ICollection<MyDefinitionId>> _getCoreTurrets;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<string, int>, bool> _getBlockWeaponMap;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float>> _getSortedThreats;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _setAiFocus;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int> _setWeaponTarget;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool, bool, int> _toggleWeaponFire;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, Vector3D?> _getPredictedTargetPos;
+    private Func<long, float> _getOptimalDps;
+
+    public bool Activate(Sandbox.ModAPI.Ingame.IMyTerminalBlock pbBlock)
+    {
+        var dict = pbBlock.GetProperty("WcPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(pbBlock);
+        if (dict == null) throw new Exception($"WcPbAPI failed to activate");
+        return ApiAssign(dict);
+    }
+
+    public bool ApiAssign(IReadOnlyDictionary<string, Delegate> delegates)
+    {
+        if (delegates == null)
+            return false;
+
+        AssignMethod(delegates, "GetCoreStaticLaunchers", ref _getCoreStaticLaunchers);
+        AssignMethod(delegates, "GetCoreTurrets", ref _getCoreTurrets);
+        AssignMethod(delegates, "GetBlockWeaponMap", ref _getBlockWeaponMap);
+        AssignMethod(delegates, "GetSortedThreats", ref _getSortedThreats);
+        AssignMethod(delegates, "SetAiFocus", ref _setAiFocus);
+        AssignMethod(delegates, "SetWeaponTarget", ref _setWeaponTarget);
+        AssignMethod(delegates, "ToggleWeaponFire", ref _toggleWeaponFire);
+        AssignMethod(delegates, "GetPredictedTargetPosition", ref _getPredictedTargetPos);
+        AssignMethod(delegates, "GetOptimalDps", ref _getOptimalDps);
+        return true;
+    }
+
+    private void AssignMethod<T>(IReadOnlyDictionary<string, Delegate> delegates, string name, ref T field) where T : class
+    {
+        if (delegates == null)
+        {
+            field = null;
+            return;
+        }
+
+        Delegate del;
+        if (!delegates.TryGetValue(name, out del))
+            throw new Exception($"{GetType().Name} :: Couldn't find {name} delegate of type {typeof(T)}");
+
+        field = del as T;
+        if (field == null)
+            throw new Exception(
+                $"{GetType().Name} :: Delegate {name} is not type {typeof(T)}, instead it's: {del.GetType()}");
+    }
+
+
+    public void GetAllCoreStaticLaunchers(ICollection<MyDefinitionId> collection) =>
+        _getCoreStaticLaunchers?.Invoke(collection);
+
+    public void GetAllCoreTurrets(ICollection<MyDefinitionId> collection) => _getCoreTurrets?.Invoke(collection);
+
+    public bool GetBlockWeaponMap(Sandbox.ModAPI.Ingame.IMyTerminalBlock weaponBlock, IDictionary<string, int> collection) =>
+        _getBlockWeaponMap?.Invoke(weaponBlock, collection) ?? false;
+
+    public void GetSortedThreats(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float> collection) =>
+        _getSortedThreats?.Invoke(pBlock, collection);
+
+    public bool SetAiFocus(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, long target, int priority = 0) =>
+        _setAiFocus?.Invoke(pBlock, target, priority) ?? false;
+
+    public void SetWeaponTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long target, int weaponId = 0) =>
+        _setWeaponTarget?.Invoke(weapon, target, weaponId);
+
+    public void ToggleWeaponFire(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, bool on, bool allWeapons, int weaponId = 0) =>
+        _toggleWeaponFire?.Invoke(weapon, on, allWeapons, weaponId);
+
+    public Vector3D? GetPredictedTargetPosition(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _getPredictedTargetPos?.Invoke(weapon, targetEnt, weaponId) ?? null;
+    public float GetOptimalDps(long entity) => _getOptimalDps?.Invoke(entity) ?? 0f;
+}
+
+
+public class PbApiWrapper
+{
+    private IMyTerminalBlock _block;
+
+    private readonly Func<IMyTerminalBlock, float> _getShieldPercent;
+    private readonly Func<IMyEntity, IMyTerminalBlock> _getShieldBlock;
+    private readonly Func<IMyTerminalBlock, bool> _isShieldBlock;
+
+    public void SetActiveShield(IMyTerminalBlock block) => _block = block; // AutoSet to TapiFrontend(block) if shield exists on grid.
+
+    public PbApiWrapper(IMyTerminalBlock block)
+    {
+        _block = block;
+        var delegates = _block.GetProperty("DefenseSystemsPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(_block);
+        if (delegates == null) return;
+
+        _getShieldBlock = (Func<IMyEntity, IMyTerminalBlock>)delegates["GetShieldBlock"];
+        _isShieldBlock = (Func<IMyTerminalBlock, bool>)delegates["IsShieldBlock"];
+
+        if (!IsShieldBlock()) _block = GetShieldBlock(_block.CubeGrid) ?? _block;
+    }
+    public float GetShieldPercent() => _getShieldPercent?.Invoke(_block) ?? -1;
+    public IMyTerminalBlock GetShieldBlock(IMyEntity entity) => _getShieldBlock?.Invoke(entity) ?? null;
+    public bool IsShieldBlock() => _isShieldBlock?.Invoke(_block) ?? false;

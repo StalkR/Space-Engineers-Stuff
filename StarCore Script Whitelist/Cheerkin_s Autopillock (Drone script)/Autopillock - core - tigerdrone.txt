@@ -1,0 +1,3140 @@
+
+		const float MAX_SP = 300f;
+		const float G = 9.81f;
+		const float SpeedBullet = 750f;
+		Func<Vector3D, float> SpeedMissile = toTarget => (float)((2500 + (toTarget.Length() - Math.Pow(100, 2) / 600) * 200) / toTarget.Length());
+
+		Func<int, int> BroadcastClock = (c) => c * 5;
+
+		const int WingmanInterval = 160;
+
+		static int SalvoRearmDelay = 120;
+		static int cqbDuration = 72000;
+
+		const float StoppingPowerQuotient = 0.7f; // 0.9
+
+		static bool IsLargeGrid;
+
+		static class Variables
+		{
+			static Dictionary<string, object> v = new Dictionary<string, object> {
+				{ "cqb-distance", new Variable<double> { value = 550, parser = s => double.Parse(s) } },
+				{ "avoid-dz", new Variable<bool> { value = true, parser = s => s == "true" } },
+				{ "hold-thrust-on-rotation", new Variable<bool> { value = true, parser = s => s == "true" } },
+				{ "salvo-distance", new Variable<float> { value = 1250, parser = s => float.Parse(s) } },
+				{ "salvo-wave-count", new Variable<int> { value = 6, parser = s => int.Parse(s) } },
+				{ "cq-jab", new Variable<int> { value = 0, parser = s => int.Parse(s) } },
+				{ "torpedo-fuse-offset", new Variable<float> { value = -0.5f, parser = s => float.Parse(s) } },
+				{ "inertia-gyro-divisor", new Variable<float> { value = 30f, parser = s => float.Parse(s) } },
+				{ "follow-formation-on-start", new Variable<bool> { value = true, parser = s => s == "true" } },
+				{ "tv-spread-extent", new Variable<bool> { value = false, parser = s => s == "true" } },
+				{ "cq-jab-distance", new Variable<float> { value = 150, parser = s => float.Parse(s) } },
+				{ "ggen-tag", new Variable<string> { value = "", parser = s => s } },
+				{ "coax-rdc", new Variable<bool> { value = false, parser = s => s == "true" } },
+			};
+			public static void Set(string key, string value) { (v[key] as ISettable).Set(value); }
+			public static void Set<T>(string key, T value) { (v[key] as ISettable).Set(value); }
+			public static T Get<T>(string key) { return (v[key] as ISettable).Get<T>(); }
+			public interface ISettable
+			{
+				void Set(string v);
+				T1 Get<T1>();
+				void Set<T1>(T1 v);
+			}
+			public class Variable<T> : ISettable
+			{
+				public T value;
+				public Func<string, T> parser;
+				public void Set(string v) { value = parser(v); }
+				public void Set<T1>(T1 v) { value = (T)(object)v; }
+				public T1 Get<T1>() { return (T1)(object)value; }
+			}
+		}
+
+		static class Toggle
+		{
+			static Dictionary<string, bool> switches = new Dictionary<string, bool>
+				{
+					{ "broadcast-vectors", false },
+					{ "broadcast-wingman", false },
+					{ "stealth-antenna", false },
+					{ "turret-response", true },
+					{ "suppress-transition-control", false },
+					{ "gra-bombard", false },
+					{ "wingman-circle-rotation", false },
+					{ "damp-when-idle", true },
+					{ "debug-raycast", false },
+					{ "vtol", false }
+				};
+			public static void Set(string key, bool value)
+			{
+				switches[key] = value;
+			}
+			public static void Invert(string key)
+			{
+				switches[key] = !switches[key];
+			}
+			public static bool Check(string key)
+			{
+				return switches[key];
+			}
+		}
+
+		void OnToggleStateChange(string key)
+		{
+			switch (key)
+			{
+				case "broadcast-wingman":
+					if (!Toggle.Check("broadcast-wingman"))
+					{
+						foreach (var peer in Peers)
+						{
+							var msg = "command:set-vectors-wingman:invalidate";
+							BroadcastMessage(msg, AgentType.Unknown, peer);
+						}
+					}
+					break;
+				case "broadcast-vectors":
+					if (!Toggle.Check("broadcast-vectors"))
+					{
+						foreach (var peer in Peers)
+						{
+							var msg = "command:set-vectors:invalidate";
+							BroadcastMessage(msg, AgentType.Unknown, peer);
+						}
+					}
+					break;
+				case "suppress-transition-control":
+					if (!Toggle.Check("suppress-transition-control"))
+					{
+						PC.AllLocalThrusters().Shutdown();
+					}
+					break;
+			}
+		}
+
+		WaypointManager CreateWpMgr()
+		{
+			var wpMgr = new WaypointManager((s, cat) => { if (MainAntenna != null) MainAntenna.CustomName = Me.CubeGrid.CustomName + "> " + s; });
+
+			wpMgr.AddWaypoint(new Waypoint
+			{
+				Name = "find host",
+				TickLimit = 1,
+				OnCompletion = (pc) =>
+				{
+					if (((MeType & AgentType.Host) != AgentType.Host))
+						BroadcastMessage("handshake:greetings", AgentType.Host);
+					if (Variables.Get<bool>("follow-formation-on-start"))
+					{
+						wpMgr.InsertAfterCurrent(new Waypoint
+						{
+							Name = "follow formation",
+							AutoSwitchToNext = false,
+							TargetFeed = () => WingmanVectors,
+							AimpointShifter = (tv) => CurrentTargetVectors.Position.HasValue ? CurrentTargetVectors.Position.Value : this.PC.Fw.GetPosition() + WingmanVectors.OrientationUnit.Value.Forward * 5000,
+							PositionShifter = p =>
+							{
+								var bs = new BoundingSphereD(WingmanVectors.OrientationUnit.Value.Translation, 100);
+								return VectorOpsHelper.GetTangFreeDestinantion(this.PC.Fw.WorldMatrix, p, bs);
+							},
+							FwOverride = () => this.PC.Fw.WorldMatrix.Forward,
+							TranslationOverride = () => this.PC.Fw.GetPosition()
+						});
+					}
+				}
+			});
+
+			wpMgr.AddWaypoint(
+				new Waypoint
+				{
+					Name = "init",
+					TickLimit = 1,
+					OnCompletion = (pc) =>
+					{
+						var salvoWpCount = Variables.Get<int>("salvo-wave-count");
+						if (salvoWpCount > 0)
+						{
+							wpMgr.InsertAfterCurrent(CreateBack(() => CurrentTargetVectors, SalvoRearmDelay, null));
+
+							for (int n = 0; n < salvoWpCount; n++)
+							{
+								wpMgr.InsertAfterCurrent(CreateBack(() => CurrentTargetVectors, SalvoRearmDelay, null));
+								wpMgr.InsertAfterCurrent(CreateJab("eat this beyatch " + n, () => CurrentTargetVectors, Variables.Get<float>("salvo-distance"), 0.8f));
+								wpMgr.InsertAfterCurrent(CreateJab("eat this beyatch " + n, () => CurrentTargetVectors, Variables.Get<float>("salvo-distance"), 0.8f));
+								wpMgr.InsertAfterCurrent(CreateJab("eat this beyatch " + n, () => CurrentTargetVectors, Variables.Get<float>("salvo-distance"), 0.8f));
+							}
+
+							if ((ciws != null) && (!UnderPlanetInfl()))
+							{
+								var graPrep = new Waypoint
+								{
+									Name = "Gra b",
+									TargetFeed = () => CurrentTargetVectors,
+									FwOverride = () => this.PC.Fw.WorldMatrix.Down,
+									DistanceHandler = (d, dx, c, wp) =>
+									{
+										if ((d < Variables.Get<float>("salvo-distance") + 2000) && (c.AlignDelta.Length() < 1) && (c.Velocity.Length() < 91))
+											WpMgr.ForceNext();
+									},
+									SpeedLimit = 90
+								};
+								graPrep = GraBobmardSequence(graPrep.TargetFeed, graPrep.FwOverride, 1200, graPrep);
+								wpMgr.InsertAfterCurrent(graPrep);
+							}
+						}
+
+						if (!CurrentTargetVectors.Position.HasValue && (QueuedStaticTargets.Count > 0))
+							CurrentTargetVectors = QueuedStaticTargets.Dequeue();
+					}
+				});
+
+			var l = CreateJab("eat this beyatch last", () => CurrentTargetVectors, Variables.Get<float>("salvo-distance"), 0.8f);
+			l.OnCompletion = p => Toggle.Set("turret-response", false);
+			wpMgr.AddWaypoint(l);
+			wpMgr.AddWaypoint(CreateBack(() => CurrentTargetVectors, SalvoRearmDelay, null));
+
+			wpMgr.AddWaypoint(CreateCloseCombatWp("gatle his ass off", () => CurrentTargetVectors, cqbDuration, true, true, wFaceH));
+			wpMgr.AddWaypoint(CreateBack(() => CurrentTargetVectors, 600, null));
+
+			wpMgr.AddWaypoint(new Waypoint
+			{
+				Name = "RTB",
+				TargetFeed = () => WingmanVectors,
+				CompletionTriggerDistance = 1000,
+				OnCompletion = p => Toggle.Set("turret-response", true)
+			});
+
+			wpMgr.AddWaypoint(new Waypoint
+			{
+				Name = "request docking",
+				TickLimit = 1,
+				OnCompletion = (pc) => BroadcastMessage("request:docking", AgentType.Host, LinkHostID)
+			});
+
+			wpMgr.AddWaypoint(new Waypoint
+			{
+				Name = "awaiting docking",
+				AutoSwitchToNext = false,
+				IgnoreTFeed = true,
+				TargetFeed = () => WingmanVectors,
+				AimpointShifter = tv => PC.Fw.GetPosition() + PC.Fw.WorldMatrix.Forward,
+				PositionShifter = tv => WingmanVectors.Position.HasValue ? WingmanVectors.Position.Value : PC.Fw.GetPosition(),
+				DistanceHandler = (d, dx, c, wp) =>
+				{
+					if (DockingVectors.Position.HasValue && (docker != null))
+					{
+						WpMgr.ForceNext();
+						if (WingmanVectors.Position.HasValue)
+							WpMgr.ExecP(WingmanVectors, true);
+					}
+				}
+			});
+
+			Func<string, Waypoint> createDwp = (name) => new Waypoint
+			{
+				Name = name,
+				AimpointShifter = tv => docker.GetPosition() - DockingVectors.OrientationUnit.Value.Forward * 10000,
+				PositionShifter = p => DockingVectors.Position.Value + DockingVectors.OrientationUnit.Value.Forward * (IsLargeGrid ? 2.6f : 1.9f),
+				FwOverride = () => docker.WorldMatrix.Forward,
+				TranslationOverride = () => docker.GetPosition(),
+				TargetFeed = () => DockingVectors
+			};
+			var df = createDwp("docking-final");
+			df.AutoSwitchToNext = false;
+			df.DistanceHandler = (d, dx, c, wp) =>
+			{
+				if ((d < 20) && (c.AlignDelta.Length() < 0.8) && (docker != null))
+				{
+					docker.Connect();
+					if (docker.Status == MyShipConnectorStatus.Connected)
+					{
+						c.SetState(PillockController.State.Disabled);
+						docker.OtherConnector.CustomData = "";
+						c.RemCon.DampenersOverride = false;
+						DockingVectors.Invalidate();
+					}
+				}
+			};
+			wpMgr.AddWaypoint(df);
+
+			var launchWp = new Waypoint
+			{
+				Name = "Missile strike",
+				TargetFeed = () => CurrentTargetVectors,
+				SpeedLimit = 0,
+				DistanceHandler = (d, d1, arg3, arg4) =>
+				{
+					TriggerService.TryTriggerNamedTimer("missile-event-timer");
+					WpMgr.ForceNext();
+				},
+				OnCompletion = c =>
+				{
+					BroadcastMessage("command:force-wp:ram", AgentType.Drone);
+					WpMgr.ForceSpecificWp("follow formation");
+				}
+			};
+			wpMgr.AddWaypoint(launchWp);
+
+			var mWp = new Waypoint
+			{
+				Name = "ram",
+				TickLimit = 1,
+				OnCompletion = pc =>
+				{
+					BroadcastMessage("handshake:greetings", AgentType.Host);
+
+					wpMgr.InsertAfterCurrent(
+						new Waypoint
+						{
+							Name = "u",
+							AimpointShifter = p => CurrentTargetVectors.Position.Value,
+							TargetFeed = () => CurrentTargetVectors,
+							DistanceHandler = (d, dx, c, wp) =>
+							{
+								var tV = CurrentTargetVectors.Velocity.HasValue ? CurrentTargetVectors.Velocity.Value : Vector3D.Zero;
+								var sp = Vector3D.Dot(Vector3D.Normalize(c.Destination - c.Fw.GetPosition()), c.Velocity - tV);
+								var eta = Math.Max(0, (float)((d - 10) / sp));
+								if ((d < 150))
+								{
+									var wh = new List<IMyWarhead>();
+									GridTerminalSystem.GetBlocksOfType(wh);
+									wh.ForEach(x =>
+									{
+										x.IsArmed = true;
+										x.DetonationTime = eta;
+										x.StartCountdown();
+									});
+									if ((c.meAcceleration.Length() > 50) || (sp < 0.45 * MAX_SP))
+									{
+										wh.ForEach(x => x.Detonate());
+									}
+								}
+								else if (d < 200)
+								{
+									Runtime.UpdateFrequency = UpdateFrequency.Update1;
+									Clock = 1;
+									if (TorpsAway(eta))
+										wp.SpeedLimit = 95f;
+								}
+								else if (d < 250)
+								{
+									TriggerService.TryTriggerNamedTimer("proximity-timer");
+									wp.fRoll = true;
+									wp.PositionShifter = null;
+								}
+								else if (d < 1200)
+								{
+									wp.PositionShifter = p => p + Vector3D.Normalize(c.Fw.GetPosition() - p) * (d - 100) +
+										c.Fw.WorldMatrix.Left * 30 * Math.Cos(Math.PI * (tickCount / 60f / 2f)) +
+										c.Fw.WorldMatrix.Up * 30 * Math.Sin(Math.PI * (tickCount / 60f / 2f));
+								}
+								else if (c.Velocity.Length() > 100)
+								{
+									wp.PositionShifter = null;
+									wp.ApproachVelocity = () => Vector3D.Normalize(c.Destination - c.Fw.GetPosition()) * MAX_SP;
+								}
+							},
+							FlyThrough = true
+						});
+				}
+			};
+			wpMgr.AddWaypoint(mWp);
+
+			return wpMgr;
+		}
+
+		public Program()
+		{
+			Runtime.UpdateFrequency = UpdateFrequency.Update100;
+
+			commandRegistry = new CommandRegistry(
+				new Dictionary<string, Action<string[]>>
+					{
+						{
+							"set-vectors", (parts) => CurrentTargetVectors.ParseVectors(parts, tickCount)
+						},
+						{
+							"enqueue-vectors", (parts) =>
+								{
+									var tt = new TargetTelemetry(Clock, "q-" + tickCount, ParseVectors);
+									tt.ParseVectors(parts, tickCount);
+									QueuedStaticTargets.Enqueue(tt);
+								}
+						},
+						{
+							"set-vectors-turret-intercept", (parts) => TurretTargetVectors.ParseVectors(parts, tickCount)
+						},
+						{
+							"set-vectors-docking", (parts) => DockingVectors.ParseVectors(parts, tickCount)
+						},
+						{
+							"set-vectors-wingman", (parts) => WingmanVectors.ParseVectors(parts, tickCount)
+						},
+						{
+							"connect-all", (parts) => BroadcastMessage("handshake:greetings", broadcastSelector.Type)
+						},
+						{
+							"select-broadcast-type", (parts) =>
+								{
+									AgentType t;
+									if (Enum.TryParse(parts[2], out t))
+									{
+										broadcastSelector.Type = t;
+										SendFeedback("Broadcast target type is now " + broadcastSelector.Type.ToString(), true);
+									}
+								}
+						},
+						{
+							"select-broadcast-peer-id", (parts) =>
+								{
+									if (Peers.Count > 0)
+									{
+										if (broadcastSelector.ID == 0)
+											broadcastSelector.ID = Peers[0];
+										else
+										{
+											int index = Peers.IndexOf(broadcastSelector.ID);
+											int next = index + 1 < Peers.Count ? index + 1 : 0;
+											if (next == 0)
+											{
+												broadcastSelector.ID = 0;
+												SendFeedback("Broadcast peer ID cleared", true);
+											}
+											else
+											{
+												broadcastSelector.ID = Peers[next];
+												SendFeedback("Broadcast peer ID is now " + broadcastSelector.ID, true);
+											}
+										}
+									}
+								}
+						},
+						{
+							"wp-next", (parts) => WpMgr.ForceNext()
+						},
+						{
+							"rwp-rec", (parts) => WpMgr.RecP(WingmanVectors, parts)
+						},
+						{
+							"rwp-exec", (parts) => WpMgr.ExecP(WingmanVectors, false)
+						},
+						{
+							"rwp-exec-reverse", (parts) => WpMgr.ExecP(WingmanVectors, true)
+						},
+						{
+							"rwp-exec-cycle", (parts) => WpMgr.ExecP(WingmanVectors, false, true)
+						},
+						{
+							"rwp-clear", (parts) => WpMgr.ClearP()
+						},
+						{
+							"evasion", (parts) =>
+							{
+								if (WpMgr.CurrentWP.Name.Contains("rwp"))
+								{
+									WpMgr.CurrentWP.FwOverride = () => PC.Fw.WorldMatrix.Down;
+									WpMgr.CurrentWP.FlyThrough = true;
+									WpMgr.CurrentWP.CompletionTriggerDistance = 50;
+								}
+								else
+								{
+									WpMgr.RecP(WingmanVectors, parts);
+									WpMgr.ExecP(WingmanVectors, false);
+									WpMgr.ClearP();
+								}
+							}
+						},
+						{
+							"create-wp", (parts) => CreateWP(parts)
+						},
+						{
+							"jab", (parts) => WpMgr.InsertActiveBefore(DumbJab(() => CurrentTargetVectors))
+						},
+						{
+							"force-wp", (parts) => WpMgr.ForceSpecificWp(parts[2])
+						},
+						{
+							"pillock-mode", (parts) => PC.TrySetState(parts[2])
+						},
+						{
+							"recycle", (parts) => Recycle(GridTerminalSystem)
+						},
+						{
+							"set-value", (parts) => Variables.Set(parts[2], parts[3])
+						},
+						{
+							"bc", (parts) => BroadcastMessage(string.Join(":", parts.Skip(2)), broadcastSelector) // command:bc:command:pillock-mode:WP
+						}
+					}
+				);
+		}
+
+		Waypoint tempWp;
+		bool interruptWp;
+		void CreateWP(string[] parts)
+		{
+			//command:create-wp:Name=dr,Ng=Down,PosDirectionOverride=Forward,SpeedLimit=50:0:0:0
+			if (tempWp != null)
+				FinalizeWP();
+
+			var posCap = PC.Fw.GetPosition();
+			var values = parts[2].Split(',').ToDictionary(s => s.Split('=')[0], s => s.Split('=')[1]);
+
+			tempWp = new Waypoint() { Name = "temp wp", IgnoreTFeed = true, AutoSwitchToNext = false };
+			float _d = 1;
+
+			var vdto = ParseVectors(parts.Take(6).Skip(1).ToArray());
+			Func<Vector3D, Vector3D> sh = p => vdto.pos.Value;
+
+			Vector3D? n = null;
+			if (values.ContainsKey("AimNormal"))
+			{
+				var v = values["AimNormal"].Split(';');
+				n = new Vector3D(double.Parse(v[0]), double.Parse(v[1]), double.Parse(v[2]));
+			}
+
+			if (values.ContainsKey("Name"))
+				tempWp.Name = values["Name"];
+			if (values.ContainsKey("FlyThrough"))
+				tempWp.FlyThrough = true;
+			if (values.ContainsKey("SpeedLimit"))
+				tempWp.SpeedLimit = float.Parse(values["SpeedLimit"]);
+			if (values.ContainsKey("TriggerDistance"))
+				_d = float.Parse(values["TriggerDistance"]);
+			if (values.ContainsKey("PosDirectionOverride") && (values["PosDirectionOverride"] == "Forward"))
+			{
+				if (n.HasValue)
+				{
+					sh = p => posCap + n.Value * ((PC.Fw.GetPosition() - posCap).Length() + 5);
+				}
+				else
+					sh = p => PC.CreateFromFwDir(500);
+			}
+
+			if (parts.Length > 6)
+			{
+				tempWp.DistanceHandler = (d, sh_d, pc, wp) =>
+				{
+					if (sh_d < _d)
+					{
+						FinalizeWP();
+						commandRegistry.RunCommand(parts[7], parts.Skip(6).ToArray());
+					}
+				};
+			}
+
+			if (values.ContainsKey("Ng"))
+			{
+				tempWp.FwOverride = () => PC.Fw.WorldMatrix.Forward;
+				if (values["Ng"] == "Down")
+					tempWp.FwOverride = () => PC.Fw.WorldMatrix.Down;
+				if (UnderPlanetInfl())
+				{
+					tempWp.AimpointShifter = p => plCenter.Value;
+					tempWp.PositionShifter = p => Vector3D.Normalize(sh(p) - plCenter.Value) * (posCap - plCenter.Value).Length() + plCenter.Value;
+				}
+				else
+				{
+					if (n.HasValue)
+					{
+						tempWp.AimpointShifter = p => PC.Fw.GetPosition() + n.Value * 1000;
+					}
+					else
+						tempWp.AimpointShifter = p => PC.Fw.GetPosition() + tempWp.FwOverride() * 1000;
+				}
+			}
+
+			if (tempWp.Name == "landing")
+			{
+				tempWp.AimpointShifter = p => PC.Fw.GetPosition() + n.Value * 1000;
+				var lg = GetLocalBlock<IMyLandingGear>("apck-gear");
+				if (lg != null)
+				{
+					tempWp.TranslationOverride = () => lg.GetPosition() + lg.WorldMatrix.Down * (IsLargeGrid ? 3.5 : 0.7);
+				}
+			}
+
+			tempWp.PositionShifter = sh;
+
+			//tempWp.DistanceHandler = (d, sh_d, pc, wp) => { if (sh_d < 10) FinalizeWP(); };
+			if (interruptWp)
+				WpMgr.InsertActiveBefore(tempWp);
+			else
+			{
+				WpMgr.AddWaypoint(tempWp);
+				WpMgr.ForceSpecificWp(tempWp.Name);
+			}
+		}
+
+		void FinalizeWP()
+		{
+			if (tempWp != null)
+			{
+				if (WpMgr.CurrentWP == tempWp)
+					WpMgr.ForceNext();
+				WpMgr.RemoveWp(tempWp);
+				tempWp = null;
+			}
+		}
+
+		Waypoint CreateBack(Func<TargetTelemetry> ctv, int ticks, Action<PillockController> onCmp)
+		{
+			var b = CreateBrake(ticks, onCmp);
+			b.Name = "backdafuc";
+			b.AimpointShifter = null;
+			b.TargetFeed = ctv;
+			b.PositionShifter = tv => PC.Fw.GetPosition() - Vector3D.Normalize(ctv().Position.Value - PC.Fw.GetPosition()) * 999;
+			var wp = CreateBrake(60, pc => WpMgr.InsertAfterCurrent(b));
+			return wp;
+		}
+
+		Waypoint CreateBrake(int ticks, Action<PillockController> onCmp)
+		{
+			return new Waypoint
+			{
+				Name = "reverse",
+				TickLimit = ticks,
+				IgnoreTFeed = true,
+				PositionShifter = tv => PC.CreateFromFwDir(-150),
+				AimpointShifter = (tv) => PC.CreateFromFwDir(1),
+				OnCompletion = onCmp,
+				FlyThrough = true
+			};
+		}
+
+		Vector3D? initialAlt;
+		Vector3D? plCenter;
+		bool UnderPlanetInfl()
+		{
+			if (PC.NG != null)
+			{
+				if (plCenter == null)
+				{
+					Vector3D planetPos;
+					if (remCon.TryGetPlanetPosition(out planetPos))
+					{
+						plCenter = planetPos;
+						return true;
+					}
+				}
+				return plCenter.HasValue;
+			}
+			return false;
+		}
+
+		Waypoint DumbJab(Func<TargetTelemetry> ctv)
+		{
+			return new Waypoint
+			{
+				Name = "dj",
+				IgnoreTFeed = true,
+				PositionShifter = tv => PC.CreateFromFwDir(500),
+				AimpointShifter = (tv) => PC.CreateFromFwDir(1),
+				DistanceHandler = (d, dx, c, wp) =>
+				{
+					if (ctv().Position.HasValue)
+						dx = (ctv().Position.Value - c.Fw.GetPosition()).Length();
+					var m = Vector3D.Dot(c.Fw.WorldMatrix.Forward, PC.Velocity);
+					if ((m > MAX_SP - 0.2) && TorpsAway((float)(dx / m) + Variables.Get<float>("torpedo-fuse-offset")))
+					{
+						WpMgr.ForceNext();
+					}
+				},
+				FlyThrough = true,
+				OnCompletion = (p) =>
+				{
+					WpMgr.InsertAfterCurrent(CreateBrake(60, pc => TriggerService.TryTriggerNamedTimer("proximity-timer-ct"))); // mb on
+				}
+			};
+		}
+
+		Waypoint CreateJab(string name, Func<TargetTelemetry> ctv, double dist, float alignDelta)
+		{
+			return new Waypoint
+			{
+				Name = name,
+				TargetFeed = ctv,
+				CompletionTriggerDistance = dist,
+				DistanceHandler = (d, dx, c, wp) =>
+				{
+					if (UnderPlanetInfl())
+					{
+						var plC = plCenter.Value;
+						var toC = plC - c.Fw.GetPosition();
+
+						var targUpNorm = Vector3D.Normalize(ctv().Position.Value - plC);
+						var dest = plC + targUpNorm * (toC.Length() + dist + 2000);
+
+						var bombEntryAlt = (float)(ctv().Position.Value - dest).Length();
+						wp.CompletionTriggerDistance = bombEntryAlt - 2000 - 2000;
+						dist = wp.CompletionTriggerDistance;
+
+						if (Vector3D.Dot(Vector3D.Normalize(toC), -targUpNorm) < 0.999999f)
+						{
+							Func<Vector3D> fwO = () => PC.Fw.WorldMatrix.Right;
+							var naturalApproach = new Waypoint
+							{
+								Name = "Planet approach",
+								PositionShifter = p => dest,
+								TargetFeed = ctv,
+								CompletionTriggerDistance = 1
+							};
+							var followUp = new Waypoint
+							{
+								Name = "Gain altitude",
+								TargetFeed = ctv,
+								FwOverride = fwO,
+								PositionShifter = z => dest,
+								CompletionTriggerDistance = 5
+							};
+							if (ciws != null)
+							{
+								naturalApproach.PositionShifter = p => plC + targUpNorm * 100000;
+								naturalApproach.FwOverride = () => PC.Fw.WorldMatrix.Right;
+
+								naturalApproach = GraBobmardSequence(ctv, fwO, 3600, naturalApproach, controller =>
+								{
+									WpMgr.InsertAfterCurrent(followUp);
+									if (QueuedStaticTargets.Count > 0)
+										CurrentTargetVectors = QueuedStaticTargets.Dequeue();
+								});
+							}
+							WpMgr.InsertActiveBefore(naturalApproach);
+							return;
+						}
+					}
+
+					if ((d < dist + 200))
+					{
+						if (c.AlignDelta.Length() < alignDelta)
+						{
+							if (d < 700)
+								wFaceH.FireRockets();
+							var m = Vector3D.Dot(Vector3D.Normalize(ctv().Position.Value - c.Fw.GetPosition()), PC.Velocity);
+							if ((m > MAX_SP - 6) && TorpsAway((float)(d / m) + Variables.Get<float>("torpedo-fuse-offset")))
+							{
+								wFaceH.CeiseFire();
+								WpMgr.ForceNext();
+							}
+						}
+						if (c.AlignDelta.Length() > 45)
+						{
+							wFaceH.CeiseFire();
+							WpMgr.ForceNext();
+						}
+					}
+				},
+				ApproachVelocity = () => PC.Velocity,
+				FlyThrough = true,
+				OnCompletion = (p) =>
+				{
+					int j = Variables.Get<int>("cq-jab");
+					if (j > 0)
+						Variables.Set("cq-jab", tickCount + 900);
+					WpMgr.InsertAfterCurrent(CreateBrake(60, pc => TriggerService.TryTriggerNamedTimer("proximity-timer-ct"))); // mb on
+				}
+			};
+		}
+
+		static Vector3I[] neibs = { new Vector3I(1, 0, 0), new Vector3I(-1, 0, 0), new Vector3I(0, 1, 0), new Vector3I(0, -1, 0), new Vector3I(0, 0, 1), new Vector3I(0, 0, -1) };
+		static T GetFirstAdjacent<T>(IMyCubeBlock b) where T : class, IMyTerminalBlock
+		{
+			foreach (var shift in neibs)
+			{
+				var c = b.CubeGrid.GetCubeBlock(b.Position + shift);
+				if ((c != null) && (c.FatBlock is T))
+					return c.FatBlock as T;
+			}
+			return null;
+		}
+
+		bool TorpsAway(float eta)
+		{
+			var mbT = new List<IMyShipMergeBlock>();
+			GridTerminalSystem.GetBlocksOfType(mbT, b => b.CustomName.Contains("mb-torpedo"));
+			foreach (var mb in mbT)
+			{
+				var tr = GetFirstAdjacent<IMyTimerBlock>(mb);
+				if (tr != null)
+				{
+					tr.TriggerDelay = eta;
+					tr.StartCountdown();
+				}
+				mb.ApplyAction("OnOff_Off");
+			}
+			return mbT.Count > 0;
+		}
+
+		Waypoint GraBobmardSequence(Func<TargetTelemetry> ctv, Func<Vector3D> fwOverride, int ticks, Waypoint conditionalWp, Action<PillockController> followUp = null)
+		{
+			conditionalWp.OnCompletion = e =>
+			{
+				Toggle.Set("gra-bombard", true);
+				Toggle.Set("suppress-transition-control", true);
+				OnToggleStateChange("suppress-transition-control");
+				interruptState = InterruptState.GraBombard;
+				WpMgr.InsertAfterCurrent(new Waypoint
+				{
+					Name = "Bobmard",
+					TickLimit = ticks,
+					FwOverride = fwOverride,
+					TargetFeed = ctv,
+					OnCompletion = x =>
+					{
+						Toggle.Set("gra-bombard", false);
+						Toggle.Set("suppress-transition-control", false);
+						ciws.Reset();
+						interruptState = InterruptState.GraDanger;
+						WpMgr.InsertAfterCurrent(new Waypoint
+						{
+							Name = "gra wait",
+							TickLimit = 90,
+							DriveKind = PillockController.DriveKind.Disabled,
+							OnCompletion = followUp + (p => interruptState = InterruptState.Free)
+						});
+					}
+				});
+			};
+			return conditionalWp;
+		}
+
+		CoaxWeaponsFace wFaceH;
+		CoaxWeaponsFace wFaceL;
+		class CoaxWeaponsFace
+		{
+			public Func<IMyTerminalBlock, Vector3D> fwOverride;
+			public List<IMySmallGatlingGun> g;
+			public List<IMySmallMissileLauncher> r;
+			Action<IMyTerminalBlock> on = x => x.ApplyAction("Shoot_On");
+			Action<IMyTerminalBlock> off = x => x.ApplyAction("Shoot_Off");
+			public void FireGatlings()
+			{
+				g.ForEach(on);
+				r.ForEach(off);
+			}
+			public void FireRockets()
+			{
+				r.ForEach(on);
+				g.ForEach(off);
+			}
+			public void CeiseFire()
+			{
+				g.ForEach(off);
+				r.ForEach(off);
+			}
+		}
+
+		Waypoint CreateCloseCombatWp(string name, Func<TargetTelemetry> ctv, int tickLimit, bool avoidDz, bool considerJabbing, CoaxWeaponsFace f)
+		{
+			return new Waypoint
+			{
+				TargetFeed = ctv,
+				Name = name,
+				TickLimit = tickLimit,
+				DistanceHandler = (d, dx, c, wp) =>
+				{
+					var pcV = PC.Velocity;
+					var pcP = PC.Fw.GetPosition();
+					Func<float> cqbD = () => Variables.Get<float>("cq-jab-distance");
+					if (d > 800)
+						wp.AimpointShifter = null;
+					if (Variables.Get<bool>("coax-rdc"))
+					{
+						wp.ApproachVelocity = () => PC.Velocity;
+					}
+					else if ((d < 800) && (c.DeltaCV.X < 1) && (c.DeltaCV.Y < 1) && (c.AlignDelta.X < 3) && (c.AlignDelta.Y < 3))
+					{
+						if (considerJabbing && ((pcV.Length() < 400 * Math.Sqrt(150 / cqbD())) && (Variables.Get<int>("cq-jab") > 0) && (tickCount > Variables.Get<int>("cq-jab"))))
+						{
+							wp.PositionShifter = p => CqbShifter(p, ctv, cqbD() + 150, avoidDz && Variables.Get<bool>("avoid-dz"));
+							if ((d < cqbD() + 200) && (c.AlignDelta.X < 15))
+							{
+								wp.PositionShifter = p => CqbShifter(p, ctv, Variables.Get<double>("cqb-distance"), avoidDz && Variables.Get<bool>("avoid-dz"));
+								WpMgr.InsertActiveBefore(CreateJab("na suka!", ctv, cqbD(), 4f));
+								return;
+							}
+						}
+						if (((d < 300) || (!f.g.Any(g => g.IsFunctional))) && f.r.Any(r => r.IsFunctional))
+						{
+							var path = ctv().Position.Value - pcP;
+							wp.ApproachVelocity = () => Vector3D.Normalize(path) * SpeedMissile(path);
+							wp.AimpointShifter = (v) =>
+							{
+								var toTarget = v - pcP;
+								var rj = Vector3D.Reject(pcV, toTarget);
+								if (rj.Length() == 0)
+									return v;
+								var VpX = (float)Vector3D.Reject(pcV, toTarget).Length();
+								var VpY = (float)Vector3D.Dot(Vector3D.Normalize(toTarget), pcV);
+
+								var VrX = 0f;
+								var VrY = 100f;
+								var ArY = 600f;
+								var VrMax = 200f;
+
+								VrY += VpY;
+								VrX += VpX;
+
+								var t1 = (Math.Sqrt(VrMax * VrMax - VrX * VrX) - VrY) / ArY;
+
+								Func<double, double> xOfT = t =>
+										(ArY * t1 + VrMax * (Math.Log(ArY * (t * ArY + VrY) + ArY * Math.Sqrt(VrX * VrX + Math.Pow(t * ArY + VrY, 2))) -
+										Math.Log(ArY * (ArY * t1 + VrY) + ArY * Math.Sqrt(VrX * VrX + Math.Pow(t1 * ArY + VrY, 2))))) * VrX / ArY;
+
+								var tof = (v - pcP).Length() / SpeedMissile(v - pcP);
+								var x2 = xOfT(tof);
+								Func<double, double> damp = x => 10f / (50 * x - 0.5) + 0.3f;
+
+								return v - Vector3D.Normalize(Vector3D.Reject(pcV, toTarget)) * x2 * damp(toTarget.Length() / 800);
+							};
+							f.FireRockets();
+						}
+						else
+						{
+							wp.ApproachVelocity = () => Vector3D.Normalize(ctv().Position.Value - pcP) * SpeedBullet;
+							wp.AimpointShifter = (v) => v - Vector3D.Reject(pcV, (v - pcP)) * (v - pcP).Length() / SpeedBullet * 1.1;
+							f.FireGatlings();
+						}
+					}
+					else
+						f.CeiseFire();
+				},
+				OnCompletion = p => f.CeiseFire(),
+				ApproachVelocity = () => Vector3D.Normalize(ctv().Position.Value - PC.Fw.GetPosition()) * SpeedBullet,
+				FlyThrough = false,
+				FwOverride = () => f.fwOverride(forwardGyro),
+				PositionShifter = p => CqbShifter(p, ctv, Variables.Get<double>("cqb-distance"), avoidDz && Variables.Get<bool>("avoid-dz"))
+			};
+		}
+
+		Vector3D CqbShifter(Vector3D p, Func<TargetTelemetry> ctv, double preferredDistance, bool avoidDz)
+		{
+			Vector3D xV = new Vector3D(1, 0, 0);
+			Vector3D yV = new Vector3D(0, 1, 0);
+			Vector3D n = new Vector3D(0, 0, 1);
+			if (UnderPlanetInfl())
+			{
+				n = Vector3D.Normalize(PC.NG.Value);
+				if (initialAlt.HasValue)
+					p += (initialAlt.Value - (p - plCenter.Value)) * 0.5f;
+			}
+			else if (ctv().Velocity.Value.Length() > 20)
+				n = Vector3D.Normalize(ctv().Velocity.Value);
+			xV = Vector3D.Normalize(Vector3D.CalculatePerpendicularVector(n));
+			yV = Vector3D.Normalize(Vector3D.Cross(n, xV));
+			// 3.14 radians of 700 in 25 sec max
+			double tc = 550 / preferredDistance;
+			var pointTomove = p + xV * Math.Cos(Math.PI * (tickCount / 60f / 40f * tc)) * preferredDistance + yV * Math.Sin(Math.PI * (tickCount / 60f / 40f * tc)) * preferredDistance;
+			var tangCircle = n * 100 * Math.Cos(Math.PI * (tickCount / 60f / 2f)) + xV * 100 * Math.Sin(Math.PI * (tickCount / 60f / 2f));
+
+			return (avoidDz ?
+				VectorOpsHelper.GetTangFreeDestinantion(PC.Fw.WorldMatrix, pointTomove, new BoundingSphereD(ctv().Position.Value, preferredDistance - 50))
+				: pointTomove) + tangCircle;
+		}
+
+		IMyProgrammableBlock tp;
+		IMyProgrammableBlock outputSvcPb;
+		void Recycle(IMyGridTerminalSystem gts)
+		{
+			CurrentTargetVectors = new TargetTelemetry(Clock, "def TV", ParseVectors);
+			WingmanVectors = new TargetTelemetry(Clock, "Wingman", ParseVectors);
+			DockingVectors = new TargetTelemetry(Clock, "Docking", ParseVectors);
+			TurretTargetVectors = new TargetTelemetry(Clock, "Turret", ParseVectors);
+			LinkHostID = 0;
+			Peers.Clear();
+			tickCount = 0;
+
+			// svc
+			tp = GetLocalBlock<IMyProgrammableBlock>("a-thrust-provider");
+			outputSvcPb = GetLocalBlock<IMyProgrammableBlock>("a-hud-svc");
+
+			// required
+			InitMeIdentity();
+			forwardGyro = GetLocalBlock<IMyGyro>("forward-gyro");
+			remCon = GetLocalBlock<IMyRemoteControl>("autopillock-remcon");
+			remCon.CustomData = "";
+
+			List<IMyShipController> ctrls = new List<IMyShipController>();
+			GridTerminalSystem.GetBlocksOfType(ctrls, c => c.IsSameConstructAs(forwardGyro));
+			UserCtrlTest.Init(ctrls);
+			//var b1 = GridTerminalSystem.GetBlockWithName("Small Control Seat") as IMyShipController;
+			//if (ctrls.Contains(b1))
+			//	throw new Exception(b1.GetType().Name);
+
+			laserAntennas = new List<IMyLaserAntenna>();
+			List<IMyLaserAntenna> ants = new List<IMyLaserAntenna>();
+			gts.GetBlocksOfType(laserAntennas, a => a.CubeGrid == Me.CubeGrid);
+			gts.GetBlocksOfType(ants, a => (a.CubeGrid != Me.CubeGrid) && (a.Status != MyLaserAntennaStatus.Connected));
+			foreach (var a in laserAntennas)
+			{
+				var nearest = ants.OrderBy(b => (a.GetPosition() - b.GetPosition()).Length()).FirstOrDefault();
+				if (nearest != null)
+				{
+					string s = "GPS:" + nearest.CustomName + ":" + VectorOpsHelper.V3DtoBroadcastString(nearest.GetPosition()) + ":";
+					a.SetTargetCoords(s);
+					a.Connect();
+				}
+			}
+
+			IsLargeGrid = remCon.CubeGrid.GridSizeEnum == MyCubeSize.Large;
+
+			// optional
+			coaxialCam = GetLocalBlock<IMyCameraBlock>("coaxial-cam");
+			if (coaxialCam != null)
+				coaxialCam.EnableRaycast = true;
+			E.I(coaxialCam);
+
+			var cw = gts.GetBlockGroupWithName("coaxial-weapons");
+			if (cw != null)
+			{
+				cw.GetBlocksOfType(allGats);
+				cw.GetBlocksOfType(allRocks);
+			}
+			else
+			{
+				GridTerminalSystem.GetBlocksOfType(allGats);
+				GridTerminalSystem.GetBlocksOfType(allRocks);
+			}
+
+			gts.GetBlocksOfType(dockingPoints, c => c.IsSameConstructAs(forwardGyro) && c.CustomName.Contains("docka"));
+			docker = dockingPoints.FirstOrDefault();
+			dockingPoints.ForEach(d => d.CustomData = "");
+
+			var logpanel = GetLocalBlock<IMyTextPanel>("log-panel");
+			if (logpanel != null)
+			{
+				InitLogger(new RollingAppender(
+					new List<IMyTextPanel> { logpanel },
+					maxLinesCount: 12,
+					maxCharsPerLine: 65));
+			}
+
+			if (outputSvcPb == null)
+			{
+				panel = GetLocalBlock<IMyTextPanel>("main-panel");
+				if (panel == null)
+				{
+					IMyTextSurfaceProvider c = (IMyCockpit)ctrls.Where(x => x is IMyCockpit).FirstOrDefault();
+					panel = c?.GetSurface(1);
+				}
+			}
+
+			var ts = new List<IMyTimerBlock>();
+			gts.GetBlocksOfType(ts, t => t.IsSameConstructAs(forwardGyro));
+			TriggerService = new TimerTriggerService(ts);
+
+			antenna = null;
+
+			var normals = new Func<IMyTerminalBlock, Vector3D>[] { r => r.WorldMatrix.Forward, r => r.WorldMatrix.Backward, r => r.WorldMatrix.Up, r => r.WorldMatrix.Down, r => r.WorldMatrix.Left, r => r.WorldMatrix.Right };
+			Vector3D gMajorDir = new Vector3D();
+			Vector3D rMajorDir = new Vector3D();
+			allGats.ForEach(g => gMajorDir += g.WorldMatrix.Forward);
+			allRocks.ForEach(r => rMajorDir += r.WorldMatrix.Forward);
+			var gFront = normals.OrderByDescending(n => Vector3D.Dot(n(forwardGyro), gMajorDir)).FirstOrDefault();
+			var rFront = normals.OrderByDescending(n => Vector3D.Dot(n(forwardGyro), rMajorDir)).FirstOrDefault();
+
+			var rocks = allRocks.Where(w => Vector3D.Dot(w.WorldMatrix.Forward, rFront(forwardGyro)) > 0.95).ToList();
+			var gats = allGats.Where(w => Vector3D.Dot(w.WorldMatrix.Forward, rFront(forwardGyro)) > 0.95).ToList();
+			wFaceH = new CoaxWeaponsFace { g = gats, r = rocks, fwOverride = rFront };
+			rocks = allRocks.Where(w => Vector3D.Dot(w.WorldMatrix.Forward, gFront(forwardGyro)) > 0.95).ToList();
+			gats = allGats.Where(w => Vector3D.Dot(w.WorldMatrix.Forward, gFront(forwardGyro)) > 0.95).ToList();
+			wFaceL = new CoaxWeaponsFace { g = gats, r = rocks, fwOverride = gFront };
+
+			interceptWpBasic = CreateCloseCombatWp("general threat response", () => TurretTargetVectors, cqbDuration, true, false, wFaceH);
+			interceptWpSmallVsSmall = CreateCloseCombatWp("small threat response", () => TurretTargetVectors, cqbDuration, false, false, wFaceL);
+			interceptWpLargeVsSmall = interceptWpSmallVsSmall;
+
+			WpMgr = CreateWpMgr();
+
+			PC = new PillockController(remCon, WpMgr, TriggerService,
+				GridTerminalSystem, IGC, tp, forwardGyro, MainAntenna, Clock, MeType);
+			WpMgr.Start(PC, () => tickCount);
+
+			var pb = GridTerminalSystem.GetBlockWithName("a-gra") as IMyProgrammableBlock;
+			if (pb != null)
+				ciws = new CIWS(pb, () => WrapMessageFor(), () => tickCount);
+
+			if (!string.IsNullOrEmpty(Me.CustomData) || !string.IsNullOrEmpty(Storage))
+				pendingInitSequence = true;
+		}
+
+		public void Save()
+		{
+			Storage = WpMgr.SerializeRecPath();
+		}
+
+		// ctor ends
+		bool constructed;
+		bool pendingInitSequence;
+
+		Waypoint interceptWpBasic;
+		Waypoint interceptWpLargeVsSmall;
+		Waypoint interceptWpSmallVsSmall;
+
+		IMyShipConnector docker;
+		IMyCameraBlock coaxialCam;
+		int tickCount;
+		int Clock = 1;
+
+		List<IMySmallGatlingGun> allGats = new List<IMySmallGatlingGun>();
+		List<IMySmallMissileLauncher> allRocks = new List<IMySmallMissileLauncher>();
+
+		List<IMyLaserAntenna> laserAntennas;
+		IMyRadioAntenna antenna;
+		IMyRadioAntenna MainAntenna
+		{
+			get
+			{
+				if (antenna == null)
+				{
+					var bs = new List<IMyRadioAntenna>();
+					GridTerminalSystem.GetBlocksOfType(bs, b => b.IsSameConstructAs(Me));
+					antenna = bs.FirstOrDefault();
+				}
+				return antenna;
+			}
+		}
+
+		IMyGyro forwardGyro;
+		IMyRemoteControl remCon;
+
+		T GetClosestBlock<T>(string name) where T : class, IMyTerminalBlock
+		{
+			List<T> blocks = new List<T>();
+			GridTerminalSystem.GetBlocksOfType(blocks, (b) => b.CustomName == name);
+			T block = blocks.OrderBy(b => (Me.GetPosition() - b.GetPosition()).Length()).FirstOrDefault();
+
+			if (block == null)
+				throw new Exception("Cant find the block named'" + name + "'");
+			return block;
+		}
+
+		T GetLocalBlock<T>(string name, bool required = false) where T : class, IMyTerminalBlock
+		{
+			E.Echo("Looking for " + name);
+			List<T> blocks = new List<T>();
+			GridTerminalSystem.GetBlocksOfType(blocks, (b) => b.IsSameConstructAs(Me) && b.CustomName.Contains(name));
+			return required ? blocks.Single() : blocks.FirstOrDefault();
+		}
+
+		TimerTriggerService TriggerService;
+		class TimerTriggerService
+		{
+			Dictionary<string, IMyTimerBlock> triggers = new Dictionary<string, IMyTimerBlock>();
+			List<IMyTimerBlock> cached;
+			public TimerTriggerService(List<IMyTimerBlock> triggers)
+			{
+				cached = triggers;
+			}
+			public bool TryTriggerNamedTimer(string name)
+			{
+				IMyTimerBlock b;
+				if (!triggers.TryGetValue(name, out b))
+				{
+					b = cached.FirstOrDefault(c => c.CustomName == name);
+					if (b != null)
+						triggers.Add(name, b);
+					else
+						return false;
+				}
+				b.GetActionWithName("TriggerNow").Apply(b);
+				return true;
+			}
+		}
+
+		long LinkHostID { get; set; }
+		List<long> Peers = new List<long>();
+
+		CommandRegistry commandRegistry;
+		public class CommandRegistry
+		{
+			Dictionary<string, Action<string[]>> commands;
+			public CommandRegistry(Dictionary<string, Action<string[]>> commands)
+			{
+				this.commands = commands;
+			}
+			public void RunCommand(string id, string[] cmdParts)
+			{
+				this.commands[id].Invoke(cmdParts);
+			}
+		}
+
+		List<IncomingMessage> batch = new List<IncomingMessage>();
+		void Main(string arg)
+		{
+			if (!constructed)
+			{
+				try
+				{
+					E.Init(Echo, GridTerminalSystem);
+					Recycle(GridTerminalSystem);
+					constructed = true;
+					Runtime.UpdateFrequency = UpdateFrequency.Update1;
+				}
+				catch (Exception ex)
+				{
+					Echo(ex.ToString());
+				}
+			}
+			tickCount++;
+			E.Echo("IGC.Me: " + IGC.Me);
+			E.Echo("Starting tick " + this.tickCount);
+
+			batch.Clear();
+			var commandChannel = IGC.RegisterBroadcastListener("apck.command");
+			while (commandChannel.HasPendingMessage)
+			{
+				var m = commandChannel.AcceptMessage();
+				batch.AddRange(ParseMessage(m.Data.ToString()).ToList());
+			}
+			while (IGC.UnicastListener.HasPendingMessage)
+			{
+				var m = IGC.UnicastListener.AcceptMessage();
+				batch.AddRange(ParseMessage(m.Data.ToString()).ToList());
+			}
+
+			if (pendingInitSequence && string.IsNullOrEmpty(arg))
+			{
+				pendingInitSequence = false;
+				var cmds = Me.CustomData.Trim('\n').Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("//")).Select(s => "[" + s + "]").ToList();
+				cmds.AddRange(Storage.Trim('\n').Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(s => "[" + s + "]").ToList());
+				arg = string.Join(",", cmds);
+			}
+
+			if (!string.IsNullOrEmpty(arg) && arg.Contains(":"))
+			{
+				metrics.RcvMsg++;
+				batch.AddRange(ParseMessage(arg).ToList());
+			}
+
+			if (batch.Any())
+			{
+				foreach (var incomingMessage in batch)
+				{
+					if (!string.IsNullOrEmpty(incomingMessage.From))
+					{
+						// with headers
+						string[] cmdParts = incomingMessage.Msg.Split(':');
+						if (cmdParts[0] == "handshake")
+						{
+							long id = long.Parse(incomingMessage.From);
+							if (cmdParts[1] == "greetings")
+							{
+								if ((MeType & AgentType.Host) != AgentType.Host)
+								{
+									if ((LinkHostID == 0) || (LinkHostID == id))
+									{
+										LinkHostID = id;
+										SendFeedback("Establishing connection to " + incomingMessage.From, true);
+										BroadcastMessage("handshake:reply", AgentType.Host, id);
+										if ((MainAntenna != null) && Toggle.Check("stealth-antenna"))
+											MainAntenna.Radius = 1000;
+									}
+								}
+								else
+								{
+									if (!Peers.Contains(id))
+									{
+										Peers.Add(id);
+										SendFeedback("Newborn agent connected: " + incomingMessage.From, true);
+										BroadcastMessage("handshake:reply", AgentType.Unknown, id);
+									}
+								}
+							}
+							if (cmdParts[1] == "reply")
+							{
+								if ((MeType & AgentType.Host) != AgentType.Host)
+								{
+									SendFeedback("Connected to host " + incomingMessage.From, true);
+									LinkHostID = id;
+								}
+								else
+								{
+									if (!Peers.Contains(id))
+									{
+										SendFeedback("Established connection to " + incomingMessage.From, true);
+										Peers.Add(id);
+									}
+								}
+							}
+						}
+						if (cmdParts[0] == "request")
+						{
+							if (cmdParts[1] == "docking")
+							{
+								SendFeedback(string.Format("request docking '{0}'", incomingMessage.From), true);
+
+								if (!dockingPoints.Any(d => d.CustomData == incomingMessage.From))
+								{
+									var freeDock = dockingPoints.FirstOrDefault(d => string.IsNullOrEmpty(d.CustomData) && (d.Status == MyShipConnectorStatus.Unconnected));
+									if (freeDock != null)
+										freeDock.CustomData = incomingMessage.From;
+								}
+							}
+						}
+						arg = incomingMessage.Msg;
+					}
+					else
+						arg = incomingMessage.Msg;
+					if (!string.IsNullOrEmpty(arg))
+					{
+						string[] cmdParts = arg.Split(new[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+						if (cmdParts[0] == "toggle")
+						{
+							Toggle.Invert(cmdParts[1]);
+							SendFeedback(string.Format("Switching '{0}' to state '{1}'", cmdParts[1], Toggle.Check(cmdParts[1])), true);
+							OnToggleStateChange(cmdParts[1]);
+						}
+						if (cmdParts[0] == "command")
+						{
+							commandRegistry.RunCommand(cmdParts[1], cmdParts);
+						}
+					}
+				}
+			}
+
+			if ((tickCount % Clock) == 0)
+			{
+				if (Toggle.Check("gra-bombard") && CurrentTargetVectors.Position.HasValue && (ciws != null) && (interruptState == InterruptState.GraBombard))
+					ciws.CiwsIntercept(CurrentTargetVectors);
+
+				if (Toggle.Check("turret-response"))
+				{
+					if (TurretTargetVectors.Position.HasValue)
+					{
+						if (interruptState == InterruptState.Free)
+						{
+							var type = TurretTargetVectors.Type;
+							if (type.HasValue && (type.Value == MyDetectedEntityType.SmallGrid))
+							{
+								if (IsLargeGrid)
+									WpMgr.InsertActiveBefore(interceptWpLargeVsSmall);
+								else
+									WpMgr.InsertActiveBefore(interceptWpSmallVsSmall);
+							}
+							else
+								WpMgr.InsertActiveBefore(interceptWpBasic);
+							interruptState = InterruptState.Intercepting;
+							WpMgr.RecP(WingmanVectors, new string[] {""});
+							if (UnderPlanetInfl())
+								initialAlt = forwardGyro.GetPosition() - plCenter.Value;
+						}
+					}
+					else
+					{
+						if ((WpMgr.CurrentWP == interceptWpBasic) || (WpMgr.CurrentWP == interceptWpLargeVsSmall) || (WpMgr.CurrentWP == interceptWpSmallVsSmall))
+						{
+							interruptState = InterruptState.Free;
+							WpMgr.ForceNext();
+							WpMgr.ExecP(WingmanVectors, false);
+							WpMgr.ClearP();
+						}
+					}
+				}
+
+				if (Toggle.Check("broadcast-vectors") && CurrentTargetVectors.Position.HasValue && ((tickCount % BroadcastClock(Clock)) == 0))
+				{
+					if (CurrentTargetVectors.Position.HasValue)
+					{
+						var msg1 = string.Format("command:set-vectors:{0}", VectorOpsHelper.V3DtoBroadcastString(CurrentTargetVectors.Position.Value, CurrentTargetVectors.Velocity.Value));
+						BroadcastMessage(msg1, null, Peers.ToArray());
+					}
+				}
+
+				if (Toggle.Check("broadcast-wingman") && ((tickCount % BroadcastClock(Clock)) == 0))
+				{
+					var basePoint = PC.Fw.GetPosition();
+					int n = 0;
+					foreach (var peer in Peers)
+					{
+						double arcShift = 2 * Math.PI / Peers.Count;
+
+						Func<Vector3D, MatrixD, double, double, Vector3D> circle = (tr, wm, r, arc) => tr
+								+ wm.Right * Math.Cos(Math.PI * (tickCount / 60f / 30f) + arc) * r
+								+ wm.Up * Math.Sin(Math.PI * (tickCount / 60f / 30f) + arc) * r;
+
+						Vector3D pos;
+						if (Toggle.Check("wingman-circle-rotation"))
+							pos = circle(basePoint, PC.Fw.WorldMatrix, 350, arcShift * n++);
+						else
+						{
+							n = (n > 0) ? n * (-1) : (Math.Abs(n) + WingmanInterval);
+							pos = basePoint + PC.Fw.WorldMatrix.Up * 50 + PC.Fw.WorldMatrix.Left * n;
+						}
+
+						var msg = string.Format("command:set-vectors-wingman:{0}:{1}:{2}",
+							VectorOpsHelper.V3DtoBroadcastString(pos, PC.Velocity),
+							VectorOpsHelper.MtrDtoBroadcastString(PC.Fw.WorldMatrix),
+							VectorOpsHelper.V3DtoBroadcastString(Me.WorldAABB.Min, Me.WorldAABB.Max)
+						);
+						BroadcastMessage(msg, AgentType.Unknown, peer);
+					}
+				}
+
+				if ((tickCount % BroadcastClock(Clock)) == 0)
+					foreach (var d in dockingPoints.Where(d => !string.IsNullOrEmpty(d.CustomData)))
+					{
+						var msg = string.Format("command:set-vectors-docking:{0}:{1}:{2}", VectorOpsHelper.V3DtoBroadcastString(d.GetPosition(), PC.Velocity),
+							VectorOpsHelper.MtrDtoBroadcastString(d.WorldMatrix),
+							VectorOpsHelper.V3DtoBroadcastString(Me.WorldAABB.Min, Me.WorldAABB.Max)
+						);
+						BroadcastMessage(msg, AgentType.Unknown, long.Parse(d.CustomData));
+					}
+
+				PC.HandleControl(tickCount, E.Echo);
+			}
+
+			SendFeedback("CTV global: " + CurrentTargetVectors.Name);
+			Func<TargetTelemetry, string, string> e = (t, tn) => string.Format("{0}: {1}/{2}/{3} ", tn, t.Position.HasValue ? "P" : "-", t.Velocity.HasValue ? "V" : "-", t.OrientationUnit.HasValue ? "O" : "-");
+			var q = e(CurrentTargetVectors, "TV") + e(DockingVectors, "DV") + e(WingmanVectors, "WV");
+			SendFeedback(q);
+
+			if ((outputSvcPb != null) && IGC.IsEndpointReachable(outputSvcPb.EntityId) && (outputSvcPb.Enabled))
+			{
+				Echo("Delegating output to " + outputSvcPb.EntityId);
+				sbMain.AppendLine(Toggle.Check("damp-when-idle") ? "DMP" : "INR");
+				sbMain.AppendLine(Toggle.Check("vtol") && (tp != null) ? "THR" : "HC");
+				sbMain.Append("WP: ").AppendLine(WpMgr.CurrentWP?.Name);
+				IGC.SendUnicastMessage(outputSvcPb.EntityId, "draw-text",
+						new MyTuple<string, Vector2, float>(
+						sbMain.ToString(),
+						new Vector2(0f, 3.8f / 4),
+						1f
+					));
+				sbMain.Clear();
+
+				sbMain.AppendLine(q);
+				sbMain.AppendLine(Toggle.Check("turret-response") ? "TURR REACT" : "");
+				IGC.SendUnicastMessage(outputSvcPb.EntityId, "draw-text",
+						new MyTuple<string, Vector2, float>(
+						sbMain.ToString(),
+						new Vector2(0f, 1.15f),
+						0.6f
+					));
+				sbMain.Clear();
+
+				var ctv = WpMgr.CurrentWP?.TargetFeed?.Invoke();
+				if (ctv?.Position != null)
+				{
+					var p = WpMgr.CurrentWP?.AimpointShifter?.Invoke(ctv.Position.Value) ?? ctv.Position.Value;
+					IGC.SendUnicastMessage(outputSvcPb.EntityId, "draw-projection",
+										new MyTuple<string, Vector2, Vector3D, Vector3D, float, string>(
+											"CircleHollow",
+											new Vector2(20f, 20f),
+											p,
+											Vector3D.Zero,
+											1f,
+											""
+									));
+				}
+			}
+
+			FlushFeedbackBuffer();
+
+			sbMain.AppendFormat("Processed in {0:f3} ms\n", Runtime.LastRunTimeMs)
+				.AppendFormat("sentMsgCount: {0}\n", sentMsgCount)
+				.AppendFormat("receivedCmdCount: {0}\n", metrics.RcvMsg)
+				.AppendFormat("ParseVectorsCount: {0}\n", metrics.ParseVectorsCount)
+				.AppendFormat("TVextrapolationsCount: {0}\n", metrics.TVextrapolationsCount)
+				.AppendFormat("TVInvalidationsCount: {0}\n", metrics.TVInvalidationsCount)
+				.AppendFormat("Host: {0}\n", LinkHostID)
+				.AppendFormat("Peers: {0}\n", Peers.Count());
+
+			E.Echo(sbMain.ToString());
+			sbMain.Clear();
+
+			FlushMessages();
+
+			lastNruns.Enqueue(Runtime.LastRunTimeMs);
+			if (lastNruns.Count == 1000)
+			{
+				double sum = 0;
+				foreach (var x in lastNruns)
+					sum += x;
+				E.Echo("1000 runs avg " + (sum / 1000f).ToString("f3") + " ms");
+				lastNruns.Dequeue();
+			}
+		}
+		Queue<double> lastNruns = new Queue<double>();
+		StringBuilder sbMain = new StringBuilder();
+
+		InterruptState interruptState = InterruptState.Free;
+		enum InterruptState { Free = 0, GraBombard, GraDanger, Intercepting }
+
+		PillockController PC;
+		class PillockController
+		{
+			public enum State { Disabled = 0, PassiveAiming, AutoHorizon, WP }
+			public enum DriveKind { Disabled = 0, VectoredThrust, DumbForwardDampened }
+
+			State state = State.Disabled;
+			public void SetState(State newState)
+			{
+				if ((state == State.Disabled) && (newState == State.WP))
+					TakeControl();
+				else if ((state == State.WP) && (newState == State.Disabled))
+					ReleaseControl();
+				state = newState;
+			}
+
+			public void TrySetState(string stateName)
+			{
+				State newState;
+				if (Enum.TryParse(stateName, out newState))
+					SetState(newState);
+			}
+
+			void TakeControl()
+			{
+				RemCon.DampenersOverride = false;
+			}
+
+			void ReleaseControl()
+			{
+				forwardGyro.GyroOverride = false;
+				AllLocalThrusters().Shutdown();
+				RemCon.DampenersOverride = true;
+			}
+
+			public PillockController(IMyRemoteControl remCon,
+				WaypointManager waypointManager, TimerTriggerService timerTriggerService, IMyGridTerminalSystem gts, 
+				IMyIntergridCommunicationSystem igc, IMyProgrammableBlock thrustProvider, IMyGyro fwGyro, IMyTerminalBlock antenna, int programClock, AgentType meType)
+			{
+				RemCon = remCon;
+				wpMgr = waypointManager;
+				GTS = gts;
+				IGC = igc;
+				forwardGyro = fwGyro;
+				MainAntenna = antenna;
+				this.clock = programClock;
+				this.meType = meType;
+				TriggerService = timerTriggerService;
+				tp = thrustProvider;
+			}
+
+			Vector3D prevCV;
+
+			public Vector3D DeltaCV { get; private set; }
+			public Vector3D AlignDelta { get; private set; }
+			public Vector3D Velocity { get { return RemCon.GetShipVelocities().LinearVelocity; } }
+			Vector3D? nG;
+			public Vector3D? NG { get { return (nG != Vector3D.Zero) ? nG : null; } }
+			AgentType meType;
+			Vector3D mePrevVelocity { get; set; }
+			public Vector3D meAcceleration { get; set; }
+			public IMyRemoteControl RemCon;
+			WaypointManager wpMgr;
+			public TimerTriggerService TriggerService { get; private set; }
+			IMyGridTerminalSystem GTS;
+			IMyIntergridCommunicationSystem IGC;
+			IMyProgrammableBlock tp;
+			int currentTick;
+			int clock;
+			IMyGyro forwardGyro;
+			IMyTerminalBlock MainAntenna;
+			public IMyTerminalBlock Fw { get { return forwardGyro; } }
+			public Vector3D Destination { get; set; }
+			public Vector3D DestinationShift { get; set; }
+			public void HandleControl(int tickCount, Action<string> echo)
+			{
+				currentTick = tickCount;
+				meAcceleration = (Velocity - mePrevVelocity) * 60 / clock;
+				mePrevVelocity = Velocity;
+				nG = RemCon.GetNaturalGravity();
+
+				if ((meType & AgentType.Host) != AgentType.Host)
+				{
+					SendFeedback("AP State: " + state.ToString() + " WP: " + wpMgr.CurrentWP.Name);
+					SendFeedback("My V: " + Velocity.Length().ToString("F1") + " My V': " + meAcceleration.Length().ToString("F1"));
+					MyPlanetElevation dElevation = new MyPlanetElevation();
+					double elevation;
+					RemCon.TryGetPlanetElevation(dElevation, out elevation);
+					Vector3D planetPos;
+					RemCon.TryGetPlanetPosition(out planetPos);
+				}
+
+				Func<Vector3D> approachVelocity = null;
+				DriveKind driveKind;
+				Func<Vector3D, Vector3D> aimpointShifter = (tv) => tv;
+				bool fRoll = false;
+				float? speedLimit = null;
+				TargetTelemetry currentTargetVectors = null;
+
+				switch (state)
+				{
+					case State.Disabled:
+						return;
+					case State.WP:
+						try
+						{
+							var wp = wpMgr.CurrentWP;
+							if (wp == null)
+							{
+								SetState(State.Disabled);
+								return;
+							}
+							approachVelocity = wp.ApproachVelocity;
+							driveKind = wp.DriveKind;
+							aimpointShifter = wp.AimpointShifter ?? aimpointShifter;
+							fRoll = wp.fRoll;
+							speedLimit = wp.SpeedLimit;
+							if (wp.TargetFeed != null)
+								currentTargetVectors = wp.TargetFeed();
+
+							if ((wp.CompletionTriggerDistance == 0) && (wpMgr.CheckCompletion(0))) // check ticklimit
+								return;
+							if (wp.IgnoreTFeed || ((currentTargetVectors != null) && (currentTargetVectors.Position.HasValue)))
+							{
+								Vector3D point;
+								Vector3D? targetVelocity = null;
+								if ((currentTargetVectors != null) && (currentTargetVectors.Position.HasValue))
+								{
+									point = currentTargetVectors.Position.Value;
+									targetVelocity = currentTargetVectors.Velocity;
+								}
+								else
+									point = Vector3D.Zero;
+
+								var gridFov = (wp.FwOverride != null) ? wp.FwOverride() : Fw.WorldMatrix.Forward;
+								var mePos = (wp.TranslationOverride != null) ? wp.TranslationOverride() : Fw.GetPosition();
+
+								if ((approachVelocity != null) && (targetVelocity.HasValue) && (targetVelocity.Value.Length() > 0))
+								{
+									Vector3D targetCenter = point;
+									Vector3D pp = VectorOpsHelper.GetPredictedImpactPoint(
+										mePos,
+										Velocity,
+										targetCenter,
+										targetVelocity.Value,
+										approachVelocity(),
+										wp.SelfVelocityAimCorrection
+										);
+									if ((point - pp).Length() < 2500)
+									{
+										//wp.Name = "lead: " + (point - pp).Length() + ", tV: " + targetVelocity.Value.Length().ToString("f2") + ", apV: " + approachVelocity().Length().ToString("f2");
+										point = pp;
+									}
+								}
+
+								Destination = point;
+								if (wp.PositionShifter != null)
+									DestinationShift = wp.PositionShifter(point);
+								else
+									DestinationShift = point;
+
+								double origD = (point - mePos).Length();
+								double shiftD = (DestinationShift - mePos).Length();
+								if (wpMgr.CheckCompletion(shiftD))
+									return;
+
+								wp.DistanceHandler?.Invoke(origD, shiftD, this, wp);
+								if ((wp != wpMgr.CurrentWP) || (state != State.WP))
+									return;
+
+								SendFeedback("AP> WP: " + wp.Name);
+
+								forwardGyro.GyroOverride = true;
+								Vector3D aimPoint = (driveKind == DriveKind.DumbForwardDampened) ? DestinationShift : point;
+								aimPoint = aimpointShifter(aimPoint);
+
+								var desM = MatrixD.CreateFromDir(Vector3D.Normalize(aimPoint - Fw.WorldMatrix.Translation));
+								Vector3D threeComponentCorrection = VectorOpsHelper.GetAnglesToPointMrot(desM, gridFov, Fw.WorldMatrix);
+
+								if (Toggle.Check("debug-raycast"))
+									E.R(aimPoint);
+
+								AlignDelta = new Vector3D(Math.Abs(threeComponentCorrection.X), Math.Abs(threeComponentCorrection.Y), Math.Abs(threeComponentCorrection.Z)); // grads
+								DeltaCV = AlignDelta - prevCV;
+								prevCV = AlignDelta;
+
+								SendFeedback("Align delta: " + threeComponentCorrection.Length().ToString("F2"));
+
+								if (fRoll)
+									VectorOpsHelper.SetOverride(forwardGyro, threeComponentCorrection, DeltaCV, clock, fixedRoll: 5);
+								else
+									VectorOpsHelper.SetOverride(forwardGyro, threeComponentCorrection, DeltaCV, clock);
+
+								if ((Variables.Get<bool>("hold-thrust-on-rotation") && (AlignDelta.Length() > 45)) || Toggle.Check("suppress-transition-control"))
+								{
+									CC(Fw.WorldMatrix.Translation, Fw.WorldMatrix.Translation, DriveKind.VectoredThrust, false, null, null, false);
+								}
+								else
+								{
+									CC(mePos, DestinationShift, driveKind, fRoll, targetVelocity, speedLimit, wp.FlyThrough);
+								}
+							}
+							else
+							{
+								forwardGyro.GyroOverride = false;
+								if (Toggle.Check("damp-when-idle"))
+									CC(Fw.WorldMatrix.Translation, Fw.WorldMatrix.Translation, DriveKind.VectoredThrust, false, null, 0, false);
+								else
+									CC(Fw.WorldMatrix.Translation, Fw.WorldMatrix.Translation, DriveKind.VectoredThrust, false, null, null, false);
+							}
+						}
+						catch (Exception ex)
+						{
+							MainAntenna.CustomName += "HC Exception! See remcon cdata";
+							var r = RemCon;
+							r.CustomData += "wpname: " + wpMgr.CurrentWP?.Name + "\n";
+							r.CustomData += "ctv: " + currentTargetVectors?.Name + "\n";
+							r.CustomData += ex.ToString();
+							SetState(State.Disabled);
+							//throw ex;
+						}
+						break;
+				}
+			}
+
+			void CC(Vector3D gridTrans, Vector3D interceptionPoint, DriveKind driveKind, bool fRoll, Vector3D? targetVel, float? speedLimit, bool flyThrough)
+			{
+				if (driveKind == DriveKind.Disabled)
+				{
+					ReleaseControl();
+					return;
+				}
+
+				var pt = interceptionPoint;
+
+				if (driveKind == DriveKind.VectoredThrust)
+				{
+					var zMatr = forwardGyro.WorldMatrix;
+					zMatr.Translation = gridTrans;
+					var toTarget = interceptionPoint - zMatr.Translation;
+
+					bool vtolTest = Toggle.Check("vtol");
+					if (!vtolTest)
+					{
+						float mass = RemCon.CalculateShipMass().PhysicalMass;
+						BoundingBoxD accCap = AllLocalThrusters().GetCapacityBB(mass);
+						if (accCap.Volume == 0)
+							return;
+
+						var invMatrix = MatrixD.Transpose(zMatr);
+						var localVel = -Vector3D.TransformNormal(Velocity, invMatrix);
+						localVel.Y *= -1;
+						var relativeVel = localVel;
+
+						Vector3D localGVector = Vector3D.Zero;
+						if (NG != null)
+						{
+							localGVector = Vector3D.TransformNormal(NG.Value, MatrixD.Transpose(forwardGyro.WorldMatrix));
+							localGVector.Y *= -1;
+							accCap += -localGVector;
+						}
+
+						Vector3D overrideVector = new Vector3D();
+						if (toTarget.Length() > double.Epsilon)
+						{
+							Vector3D zeroBasedTargetPoint = -Vector3D.TransformNormal(toTarget, invMatrix);
+							zeroBasedTargetPoint.Y *= -1;
+
+							RayD rayToCenter = new RayD(zeroBasedTargetPoint, Vector3D.Normalize(-zeroBasedTargetPoint));
+							RayD rayToCenterInv = new RayD(-zeroBasedTargetPoint, Vector3D.Normalize(zeroBasedTargetPoint));
+
+							var reversePoint = rayToCenterInv.Position + (Vector3D.Normalize(rayToCenterInv.Direction) * rayToCenterInv.Intersects(accCap).Value);
+							var point = rayToCenter.Position + (Vector3D.Normalize(rayToCenter.Direction) * rayToCenter.Intersects(accCap).Value);
+							/*
+							Vector3D point = new Vector3D();
+							Vector3D reversePoint = new Vector3D();
+							var xs = rayToCenter.Intersects(accCap);
+							if (xs.HasValue)
+								point = rayToCenter.Position + rayToCenter.Direction * xs.Value;
+							xs = rayToCenterInv.Intersects(accCap);
+							if (xs.HasValue)
+								reversePoint = rayToCenterInv.Position + rayToCenterInv.Direction * xs.Value;
+								*/
+							//var toOppositeTargetCapacity = Math.Max(reversePoint.Length(), double.Epsilon);
+							var toOppositeTargetCapacity = reversePoint.Length();
+							SendFeedback("VT> reverse capacity: " + toOppositeTargetCapacity.ToString("F1"));
+
+							Vector3D reject = Vector3D.Reject(localVel, Vector3D.Normalize(zeroBasedTargetPoint));
+							relativeVel -= reject;
+
+							if (targetVel.HasValue)
+							{
+								var targetLocalVel = -Vector3D.TransformNormal(targetVel.Value, invMatrix);
+								targetLocalVel.Y *= -1;
+								SendFeedback("VT> Target speed: " + targetLocalVel.Length().ToString("F1"));
+								relativeVel = localVel - targetLocalVel;
+							}
+							var relativeSpeed = relativeVel.Length() * Vector3D.Dot(Vector3D.Normalize(relativeVel), Vector3D.Normalize(zeroBasedTargetPoint));
+
+							SendFeedback("VT> Approach speed: " + relativeSpeed.ToString("F1"));
+
+							bool closingDistance = relativeSpeed > 0;
+							bool accelerate = true;
+
+							if (closingDistance)
+							{
+								var stoppingPathAtCurrentSpeed = Math.Pow(relativeSpeed, 2) / (StoppingPowerQuotient * toOppositeTargetCapacity); // 0.9 и ещё у гравов 1/1.8
+								SendFeedback("VT> stoppingPathAtCurrentSpeed: " + stoppingPathAtCurrentSpeed.ToString("F1"));
+								if (stoppingPathAtCurrentSpeed > zeroBasedTargetPoint.Length())
+									accelerate = false;
+							}
+							SendFeedback("VT> accelerate: " + accelerate);
+
+							if (flyThrough || accelerate)
+							{
+								overrideVector = point;
+								if ((speedLimit.HasValue) && (Vector3D.Dot(Vector3D.Normalize(toTarget), Velocity) >= speedLimit))
+								{
+									overrideVector = reversePoint;
+									//overrideVector *= Math.Min((relativeSpeed - speedLimit.Value) / toOppositeTargetCapacity, toOppositeTargetCapacity);
+									overrideVector *= (relativeSpeed - speedLimit.Value) / toOppositeTargetCapacity;
+								}
+							}
+							else
+								overrideVector = reversePoint;
+							
+							if (accelerate)
+							{
+								var worldAprroachVel = Vector3D.Dot(Vector3D.Normalize(toTarget), Velocity);
+								if (worldAprroachVel > MAX_SP - 0.001)
+								{
+									overrideVector = new Vector3D();
+								}
+							}
+							
+							overrideVector -= reject;
+						}
+						else if ((speedLimit.HasValue) && (speedLimit == 0))
+							overrideVector -= localVel;
+
+						if (NG != null)
+						{
+							SendFeedback("localG: " + localGVector.ToString("F1"));
+							overrideVector += localGVector;
+						}
+
+						overrideVector += UserCtrlTest.GetUserCtrlVector(Fw.WorldMatrix);
+
+						SendFeedback("applied V' vector: " + overrideVector.ToString("F1"));
+						AllLocalThrusters().SetOverride(overrideVector, mass);
+					}
+					else
+					{
+						AllLocalThrusters().Shutdown();
+
+						if (tp != null)
+						{
+							if (IGC.IsEndpointReachable(tp.EntityId))
+							{
+								var d = interceptionPoint;
+								var f = gridTrans;
+								IGC.SendUnicastMessage(tp.EntityId, "thrust", ImmutableArray.Create(d.X, d.Y, d.Z, f.X, f.Y, f.Z, flyThrough ? 1d : 0d, speedLimit.HasValue ? speedLimit.Value : -1));
+							}
+							else
+							{
+								throw new Exception("VTOL: a-thrust-provider is not reachable");
+							}
+						}
+					}
+				}
+
+				else if (driveKind == DriveKind.DumbForwardDampened)
+				{
+					forwardGyro.GyroOverride = true;
+				}
+			}
+
+			ThrusterSelector cached;
+			public ThrusterSelector AllLocalThrusters()
+			{
+				if ((cached == null) || (currentTick % 150 == 0))
+					cached = new ThrusterSelector(Fw, GTS, RemCon, b => Fw.CubeGrid == b.CubeGrid && b.IsFunctional);
+				return cached;
+			}
+
+			public Vector3D CreateFromFwDir(float meters)
+			{
+				return Fw.GetPosition() + Fw.WorldMatrix.Forward * meters;
+			}
+		}
+
+		Queue<TargetTelemetry> QueuedStaticTargets = new Queue<TargetTelemetry>();
+
+		TargetTelemetry DockingVectors { get; set; }
+		TargetTelemetry WingmanVectors { get; set; }
+		TargetTelemetry CurrentTargetVectors { get; set; }
+		TargetTelemetry TurretTargetVectors { get; set; }
+		TargetTelemetry TargetRichData { get; set; }
+
+		public class TargetTelemetry
+		{
+			public int TickStamp;
+			int clock;
+			public string Name;
+			public Vector3D? Position { get; private set; }
+			public Vector3D? Velocity;
+			public Vector3D? Acceleration;
+			public MatrixD? OrientationUnit;
+			public BoundingBoxD? BoundingBox;
+			public MyDetectedEntityType? Type { get; set; }
+			public delegate void InvalidatedHandler(Object sender, EventArgs e);
+			public event InvalidatedHandler OnInvalidated;
+			Func<string[], TeleDto> dG;
+			public TargetTelemetry(int clock, string name, Func<string[], TeleDto> dataGetter)
+			{
+				Name = name;
+				this.clock = clock;
+				dG = dataGetter;
+			}
+			public void SetPosition(Vector3D pos, int tickStamp)
+			{
+				Position = pos;
+				TickStamp = tickStamp;
+			}
+			public void PredictPostion(int tick, int clock)
+			{
+				if ((Velocity.HasValue) && (Velocity.Value.Length() > double.Epsilon) && (tick - TickStamp) > 0)
+				{
+					Position += Velocity * (tick - TickStamp) * clock / 60;
+					metrics.TVextrapolationsCount++;
+				}
+			}
+			public void ParseVectors(string[] cmdString, int tickTimeStamp)
+			{
+				try
+				{
+					if (cmdString[2] == "invalidate")
+					{
+						Invalidate();
+						var tmp = OnInvalidated;
+						if (tmp != null)
+							OnInvalidated(this, null);
+					}
+					else
+					{
+						var pv = dG(cmdString);
+
+						SetPosition(pv.pos.Value, tickTimeStamp);
+
+						if (pv.vel.HasValue)
+						{
+							if (!Velocity.HasValue)
+								Velocity = pv.vel;
+							Acceleration = (pv.vel.Value - Velocity.Value) * 60 / clock;
+							Velocity = pv.vel;
+						}
+						if (pv.rot.HasValue)
+							OrientationUnit = pv.rot;
+
+						if (pv.bb.HasValue)
+							BoundingBox = pv.bb;
+						
+						if (pv.type.HasValue)
+							Type = pv.type;
+
+						metrics.ParseVectorsCount++;
+					}
+				}
+				catch
+				{
+					throw (new Exception("PV fail, cmdString: " + string.Join(":", cmdString)));
+				}
+			}
+			public void Invalidate()
+			{
+				Position = null;
+				Velocity = null;
+				OrientationUnit = null;
+				BoundingBox = null;
+				metrics.TVInvalidationsCount++;
+			}
+		}
+
+		public struct TeleDto
+		{
+			public Vector3D? pos;
+			public Vector3D? vel;
+			public MatrixD? rot;
+			public BoundingBoxD? bb;
+			public MyDetectedEntityType? type;
+		}
+
+		TeleDto ParseVectors(string[] cmdString)
+		{
+			try
+			{
+				var res = new TeleDto();
+
+				res.pos = new Vector3D(double.Parse(cmdString[2]), double.Parse(cmdString[3]), double.Parse(cmdString[4]));
+				
+				if (cmdString.Length > 5)
+					res.vel = new Vector3D(double.Parse(cmdString[5]), double.Parse(cmdString[6]), double.Parse(cmdString[7]));
+				
+				if (cmdString.Length > 8)
+				{
+					res.rot = new MatrixD(
+							double.Parse(cmdString[8]), double.Parse(cmdString[9]), double.Parse(cmdString[10]), double.Parse(cmdString[11]),
+							double.Parse(cmdString[12]), double.Parse(cmdString[13]), double.Parse(cmdString[14]), double.Parse(cmdString[15]),
+							double.Parse(cmdString[16]), double.Parse(cmdString[17]), double.Parse(cmdString[18]), double.Parse(cmdString[19]),
+							double.Parse(cmdString[20]), double.Parse(cmdString[21]), double.Parse(cmdString[22]), double.Parse(cmdString[23])
+						);
+				}
+				
+				if (cmdString.Length > 25)
+				{
+					res.bb = new BoundingBoxD(
+						new Vector3D(double.Parse(cmdString[24]), double.Parse(cmdString[25]), double.Parse(cmdString[26])),
+						new Vector3D(double.Parse(cmdString[27]), double.Parse(cmdString[28]), double.Parse(cmdString[29]))
+						);
+				}
+				
+				if (cmdString.Length > 30)
+					res.type = (MyDetectedEntityType)Enum.Parse(typeof(MyDetectedEntityType), cmdString[30]);
+
+				metrics.ParseVectorsCount++;
+				return res;
+			}
+			catch
+			{
+				throw (new Exception("PV fail, cmdString: " + string.Join(":", cmdString)));
+			}
+		}
+
+		static Metrics metrics;
+		struct Metrics
+		{
+			public int ParseVectorsCount;
+			public int TVextrapolationsCount;
+			public int RcvMsg;
+			public int TVInvalidationsCount;
+		}
+
+		static class VectorOpsHelper
+		{
+			static StringBuilder sb = new StringBuilder();
+
+			public static string V3DtoBroadcastString(params Vector3D[] vectors)
+			{
+				return string.Join(":", vectors.Select(v => string.Format("{0}:{1}:{2}", v.X, v.Y, v.Z)));
+			}
+
+			public static string MtrDtoBroadcastString(MatrixD mat)
+			{
+				sb.Clear();
+				for (int i = 0; i < 4; i++)
+				{
+					for (int j = 0; j < 4; j++)
+					{
+						sb.Append(mat[i, j] + ":");
+					}
+				}
+				return sb.ToString().TrimEnd(':');
+			}
+
+			public static Vector3D GetTangFreeDestinantion(MatrixD myMatrix, Vector3D pointTomove, BoundingSphereD dangerZone)
+			{
+				RayD r = new RayD(myMatrix.Translation, Vector3D.Normalize(pointTomove - myMatrix.Translation));
+				double? collideDist = r.Intersects(dangerZone);
+
+				if (collideDist.HasValue)
+				{
+					var toSphere = Vector3D.Normalize(dangerZone.Center - myMatrix.Translation);
+					if (dangerZone.Contains(myMatrix.Translation) == ContainmentType.Contains)
+						return dangerZone.Center - toSphere * dangerZone.Radius;
+					var dzPerp = Vector3D.Cross(r.Direction, toSphere);
+					Vector3D tangentR;
+					if (dzPerp.Length() < double.Epsilon)
+						toSphere.CalculatePerpendicularVector(out tangentR);
+					else
+						tangentR = Vector3D.Cross(dzPerp, -toSphere);
+					return dangerZone.Center + Vector3D.Normalize(tangentR) * dangerZone.Radius;
+				}
+				return pointTomove;
+			}
+
+			public static Vector3D GetPredictedImpactPoint(Vector3D meTranslation, Vector3D meVel, Vector3D targetCenter, Vector3D targetVelocity, Vector3D munitionVel, bool compensateOwnVel)
+			{
+				double munitionSpeed = Vector3D.Dot(Vector3D.Normalize(targetCenter - meTranslation), munitionVel);
+				if (munitionSpeed < 30)
+					munitionSpeed = 30;
+				return GetPredictedImpactPoint(meTranslation, meVel, targetCenter, targetVelocity, munitionSpeed, compensateOwnVel);
+			}
+
+			public static Vector3D GetPredictedImpactPoint(Vector3D origin, Vector3D originVel, Vector3D targetCenter, Vector3D targetVelocity, double munitionSpeed, bool compensateOwnVel)
+			{
+				double currentDistance = Vector3D.Distance(origin, targetCenter);
+				Vector3D target = targetCenter - origin;
+				Vector3D targetNorm = Vector3D.Normalize(target);
+				double targAngle = 0;
+				double pipAngle = 0;
+				double s = 0;
+				Vector3D assumedPosition = targetCenter;
+
+				Vector3D velNorm;
+
+				if (compensateOwnVel)
+				{
+					var rej = Vector3D.Reject(originVel, targetNorm);
+					targetVelocity -= rej;
+					SendFeedback("My velocily reject for interception: " + rej.Length().ToString("F2"));
+				}
+
+				if (targetVelocity.Length() > float.Epsilon)
+				{
+					velNorm = Vector3D.Normalize(targetVelocity);
+					targAngle = Math.PI - Math.Acos(Vector3D.Dot(targetNorm, velNorm));
+					SendFeedback("munitionSpeed: " + munitionSpeed.ToString("F2"));
+					var y = (targetVelocity.Length() * Math.Sin(targAngle)) / munitionSpeed;
+					if (Math.Abs(y) <= 1)
+					{
+						pipAngle = Math.Asin(y);
+						s = currentDistance * Math.Sin(pipAngle) / Math.Sin(targAngle + pipAngle);
+						assumedPosition = targetCenter + velNorm * s;
+					}
+				}
+
+				SendFeedback("currentDistance: " + currentDistance.ToString("F2"));
+				SendFeedback("targAngle: " + (180 * targAngle / Math.PI).ToString("F2"));
+				SendFeedback("pipAngle: " + (180 * pipAngle / Math.PI).ToString("F2"));
+				SendFeedback("S: " + s.ToString("F2"));
+
+				return assumedPosition;
+			}
+
+			public static Vector3D GetAnglesToPointMrot(MatrixD desiredRot, Vector3D myFrameFw, MatrixD fwGyroDefault)
+			{
+				//Vector3D signCorrection = new Vector3D(1, 1, 1);
+				Vector3D signCorrection = new Vector3D(-1, 1, 1);
+				MatrixD myFrameRot = MatrixD.CreateFromDir(myFrameFw, fwGyroDefault.Up);
+				if (myFrameFw == fwGyroDefault.Down)
+				{
+					myFrameRot = MatrixD.CreateFromDir(myFrameFw, fwGyroDefault.Forward);
+					desiredRot = MatrixD.CreateFromDir(desiredRot.Forward, fwGyroDefault.Forward);
+					//signCorrection = new Vector3D(-1, 1, -1);
+					signCorrection = new Vector3D(-1, -1, -1);
+				}
+				else if (myFrameFw == fwGyroDefault.Up)
+				{
+					myFrameRot = MatrixD.CreateFromDir(myFrameFw, fwGyroDefault.Backward);
+					signCorrection = new Vector3D(-1, -1, -1);
+				}
+				else if ((myFrameFw == fwGyroDefault.Left) || (myFrameFw == fwGyroDefault.Left))
+				{
+					signCorrection = new Vector3D(1, 1, -1);
+				}
+
+				var trans = desiredRot * MatrixD.Transpose(myFrameRot);
+				Vector3D a;
+				MatrixD.GetEulerAnglesXYZ(ref trans, out a);
+				a = Vector3D.TransformNormal(a, fwGyroDefault * MatrixD.Transpose(myFrameRot));
+				a = a * 180 / Math.PI;
+				a *= signCorrection;
+				return a;
+			}
+
+			public static void SetOverridePID(IMyGyro gyro, Vector3 settings, Vector3D deltaS, int clock, float? fixedRoll = null)
+			{
+				float yaw = settings.Y;
+				float pitch = settings.X;
+				float roll = settings.Z;
+
+				float yawRads = (float)(yaw / 180 * Math.PI);
+				float pitchRads = (float)(pitch / 180 * Math.PI);
+				float rollRads = (float)(roll / 180 * Math.PI);
+
+				int gyroRPMlimit = IsLargeGrid ? 30 : 60;
+
+				Func<double, double, double> pow = (p, d) =>
+				{
+					var dMod = d * gyroRPMlimit * 50f;
+					var pMod = p * gyroRPMlimit / 1.5f;
+					if (Math.Abs(dMod) > Math.Abs(pMod))
+						return 0;
+					return pMod - Math.Sign(p) * dMod;
+				};
+
+				var realRPMyaw = (float)pow(yawRads, deltaS.Y);
+				var realRPMpitch = (float)pow(pitchRads, deltaS.X);
+				var realRPMroll = (float)pow(rollRads, deltaS.Z);
+
+				if (fixedRoll.HasValue)
+					realRPMroll = fixedRoll.Value;
+				gyro.SetValue("Yaw", realRPMyaw);
+				gyro.SetValue("Pitch", realRPMpitch);
+				gyro.SetValue("Roll", realRPMroll);
+			}
+
+			public static void SetOverride(IMyGyro gyro, Vector3 settings, Vector3D deltaS, int clock, float? fixedRoll = null)
+			{
+				var maxFactor = 3f;
+				var curv = 2f;
+				Func<double, double, double> ampF = (x, d) => x * (Math.Exp(-d * curv) + 0.8) * maxFactor / 2;
+
+				if ((deltaS.Length() < 2) && (settings.Length() > 1))
+				{
+					settings.X = (float)ampF(settings.X, deltaS.Length());
+					settings.Y = (float)ampF(settings.Y, deltaS.Length());
+					SendFeedback("Settings are amped");
+				}
+				else
+				{
+					SendFeedback("Settings are untouched");
+				}
+				SetOverride(gyro, settings, clock, fixedRoll);
+			}
+
+			public static void SetOverride(IMyGyro gyro, Vector3 settings, int clock, float? fixedRoll = null)
+			{
+				float yaw = settings.Y;
+				float pitch = settings.X;
+				float roll = settings.Z;
+
+				float yawRads = (float)(yaw / 180 * Math.PI);
+				float pitchRads = (float)(pitch / 180 * Math.PI);
+				float rollRads = (float)(roll / 180 * Math.PI);
+
+				int gyroRPMlimit = IsLargeGrid ? 30 : 60;
+
+				double RPMtoRadsSec = 2 * Math.PI / 60f; // 0.1047
+
+				var radsPerTickMax = gyroRPMlimit * RPMtoRadsSec / 60; // PI @ clock = 1 for large grid
+
+				Func<double, double> rpmLimitSimple = x =>
+				{
+					var mag = Math.Abs(x); // rads
+					float intertLagC = Variables.Get<float>("inertia-gyro-divisor"); // 7
+																					 //if ((mag < 0.25) && (intertLagC > 4))
+																					 //	intertLagC = 4f;
+
+					// for ASF intertLagC = 12 is ok at high mag, 4 is ok at low mag, 1 makes it wobble around aimpoint
+					// for small grid massive MMF intertLagC = 1 is ok always
+					// mag > radsPerTickMax * 30 worked OK too, loosing the mag / (radsPerTickMax * intertLagC) part
+					return mag > radsPerTickMax * intertLagC ? gyroRPMlimit : mag / (radsPerTickMax * intertLagC) * gyroRPMlimit;
+					// Dr: / 12 (clock) * 20 = 1.66
+					// New: / 60 * 30 = 0.5
+					// ASF: 1 and 0.33
+				};
+
+				var realRPMyaw = (float)rpmLimitSimple(yawRads) * Math.Sign(yaw); // max at 0.4165 (per tick), 5 per sec
+				var realRPMpitch = (float)rpmLimitSimple(pitchRads) * Math.Sign(pitch);
+				var realRPMroll = (float)rpmLimitSimple(rollRads) * Math.Sign(roll);
+
+				if (fixedRoll.HasValue)
+					realRPMroll = fixedRoll.Value;
+				gyro.SetValue("Yaw", realRPMyaw);
+				gyro.SetValue("Pitch", realRPMpitch);
+				gyro.SetValue("Roll", realRPMroll);
+
+				//gyro.CustomName = $"{realRPMyaw:F2}, {realRPMpitch:F2}, {realRPMroll:F2}";
+				//gyro.ShowOnHUD = true;
+
+				sb.Clear();
+				sb.AppendLine($"Yaw raw input rads: {yawRads:F2}({realRPMyaw:F2})");
+				sb.AppendLine($"Pitch raw input rads: {pitchRads:F2}({realRPMpitch:F2})");
+				sb.AppendLine($"Roll raw input rads: {rollRads:F2}({realRPMroll:F2})");
+				SendFeedback(sb.ToString());
+			}
+		}
+
+		enum DriverKind
+		{
+			DampenedDirectional = 0,
+			ThrustVector
+		}
+		class Waypoint
+		{
+			public string Name { get; set; }
+			public bool AutoSwitchToNext = true;
+			public Func<Vector3D, Vector3D> PositionShifter { get; set; }
+			public double CompletionTriggerDistance { get; set; }
+			public int? TickLimit { get; set; }
+			public Action<double, double, PillockController, Waypoint> DistanceHandler { get; set; }
+			public Action<PillockController> OnCompletion { get; set; }
+			public Func<Vector3D> ApproachVelocity;
+			public PillockController.DriveKind DriveKind = PillockController.DriveKind.VectoredThrust;
+			public Func<Vector3D, Vector3D> AimpointShifter = (tv) => tv;
+			public Func<Vector3D> FwOverride;
+			public Func<Vector3D> TranslationOverride;
+			public bool fRoll;
+			public float? SpeedLimit;
+			public bool SelfVelocityAimCorrection = false;
+			public bool FlyThrough = false;
+			public bool IgnoreTFeed;
+			public Func<TargetTelemetry> TargetFeed;
+
+			public int StartTick { get; private set; }
+
+			public void Init(PillockController pc, int tick)
+			{
+				if (StartTick == 0)
+					StartTick = tick;
+				pc.TriggerService.TryTriggerNamedTimer(Name + ".OnStart");
+			}
+		}
+		WaypointManager WpMgr { get; set; }
+		class WaypointManager
+		{
+			LinkedList<Waypoint> waypoints;
+			LinkedListNode<Waypoint> current;
+			Action<string, bool> sender;
+			Func<int> getTick;
+			PillockController pc;
+			public Waypoint CurrentWP { get { return current.Value; } }
+
+			List<Waypoint> recPathWP = new List<Waypoint>();
+			List<RecPathNode> recPath = new List<RecPathNode>();
+			class RecPathNode
+			{
+				public Vector3D Pos { get; set; }
+				public Vector3D Aim { get; set; }
+				public bool Relative { get; set; }
+			}
+
+			public void RecP(Vector3D pos, Vector3D aim)
+			{
+				recPath.Add(new RecPathNode { Aim = aim, Pos = pos });
+			}
+
+			public void RecP(TargetTelemetry t, string[] cmdString)
+			{
+				Vector3D p, a;
+				if (cmdString.Length > 2)
+				{
+					p = new Vector3D(double.Parse(cmdString[2]), double.Parse(cmdString[3]), double.Parse(cmdString[4]));
+					a = new Vector3D(double.Parse(cmdString[5]), double.Parse(cmdString[6]), double.Parse(cmdString[7]));
+				}
+				else
+				{
+					p = pc.Fw.GetPosition();
+					a = p + pc.Fw.WorldMatrix.Forward * 1000;
+				}
+				var rpn = new RecPathNode { Pos = p, Aim = a };
+				rpn.Relative = (cmdString.Length > 8) && cmdString[8] == "relative";
+
+				if (t.OrientationUnit.HasValue && !rpn.Relative)
+				{
+					rpn.Pos = Vector3D.TransformNormal(p - t.OrientationUnit.Value.Translation, MatrixD.Transpose(t.OrientationUnit.Value));
+					rpn.Relative = true;
+				}
+
+				recPath.Add(rpn);
+			}
+
+			LinkedListNode<Waypoint> _cwp;
+			TargetTelemetry dummyZeroTel = new TargetTelemetry(int.MaxValue, "", s => new TeleDto());
+			public void ExecP(TargetTelemetry t, bool reverse, bool repeat = false)
+			{
+				dummyZeroTel.SetPosition(Vector3D.Zero, 0);
+				if (recPath.Count() > 0)
+				{
+					if (!recPathWP.Contains(current.Value))
+						_cwp = current;
+					else
+						recPathWP.ForEach(w => waypoints.Remove(w));
+					recPathWP.Clear();
+					for (int n = 0; n < recPath.Count; n++)
+					{
+						var rwp = recPath[n];
+						var wp = new Waypoint { Name = "rwp-" + (n + 1) + "-" + (rwp.Relative ? "rel" : "abs"), PositionShifter = t1 => rwp.Pos, CompletionTriggerDistance = 3, AimpointShifter = (v) => rwp.Aim, TargetFeed = () => t };
+						recPathWP.Add(wp);
+						if (recPath[n].Relative)
+						{
+							if (t.OrientationUnit.HasValue)
+							{
+								Func<MatrixD> ov = () => t.OrientationUnit.Value;
+								wp.PositionShifter = x => ov().Translation + Vector3D.TransformNormal(rwp.Pos, ov());
+								wp.AimpointShifter = v => ov().Translation + ov().Forward * 1000;
+							}
+							else
+								wp.Name += " ERR-NO-BASEVECTOR";
+						}
+						else
+						{
+							wp.TargetFeed = () => dummyZeroTel;
+						}
+						if (pc.NG != null)
+						{
+							Vector3D pl;
+							if (pc.RemCon.TryGetPlanetPosition(out pl))
+							{
+								wp.AimpointShifter = (v) => pl;
+								wp.FwOverride = () => pc.Fw.WorldMatrix.Down;
+							}
+						}
+					}
+
+					var seq = reverse ? recPathWP.Reverse<Waypoint>() : recPathWP;
+					foreach (var w in seq)
+					{
+						waypoints.AddBefore(_cwp, w);
+					}
+					current = waypoints.Find(seq.FirstOrDefault());
+					current.Value.Init(pc, getTick());
+					pc.SetState(PillockController.State.WP);
+					if (repeat)
+						seq.LastOrDefault().OnCompletion = p =>
+						{
+							current = _cwp;
+							ExecP(t, reverse, true);
+						};
+				}
+			}
+
+			public WaypointManager(Action<string, bool> sender)
+			{
+				this.sender = sender;
+				waypoints = new LinkedList<Waypoint>();
+			}
+
+			public void ClearP()
+			{
+				recPath.Clear(); // wp cleanup?
+			}
+
+			public string SerializeRecPath()
+			{
+				var sb = new StringBuilder();
+				foreach (var w in recPath)
+				{
+					var p = w.Pos;
+					var a = w.Aim;
+					sb.AppendFormat("command:rwp-rec:{0}:{1}:{2}:{3}:{4}:{5}:{6}\n", p.X, p.Y, p.Z, a.X, a.Y, a.Z, w.Relative ? "relative" : "absolute");
+				}
+				return sb.ToString();
+			}
+
+			public WaypointManager Start(PillockController controller, Func<int> tickCountGetter)
+			{
+				getTick = tickCountGetter;
+				pc = controller;
+				if (waypoints.Count > 0)
+				{
+					current = waypoints.First;
+					current.Value.Init(pc, getTick());
+				}
+				else
+					throw new InvalidOperationException("At least one waypoing must be added before starting WpMgr");
+				return this;
+			}
+
+			public WaypointManager AddWaypoint(Waypoint wp)
+			{
+				waypoints.AddLast(wp);
+				return this;
+			}
+			public WaypointManager InsertAfterCurrent(Waypoint wp)
+			{
+				waypoints.AddAfter(current, wp);
+				return this;
+			}
+			public void InsertActiveBefore(Waypoint wp)
+			{
+				waypoints.AddBefore(current, wp);
+				SendFeedback("iab: " + wp.Name + "->" + current.Value.Name, true);
+				current = current.Previous;
+				pc.SetState(PillockController.State.WP);
+				current.Value.Init(pc, getTick());
+			}
+
+			public bool CheckCompletion(double distance)
+			{
+				//E.Echo("wp>\n" + string.Join("\n", waypoints.Select(w => w.Name + ((current.Value == w) ? "*" : "") + ((waypoints.Find(w).Next != null) ? "+" : ""))));
+
+				var wp = current.Value;
+				string msgToAntenna = wp.Name + ": " + distance.ToString("F1") + " (" + wp.CompletionTriggerDistance.ToString("F0") + ")";
+				if (current.Next != null)
+					msgToAntenna += " next: " + current.Next.Value.Name;
+				sender(msgToAntenna, true);
+				if ((wp.AutoSwitchToNext) && ((distance < wp.CompletionTriggerDistance) || (wp.TickLimit.HasValue && (getTick() - wp.StartTick > wp.TickLimit))))
+				{
+					ForceNext();
+					return true;
+				}
+				return false;
+			}
+			public void ForceNext()
+			{
+				var wp = current.Value;
+				SendFeedback("fn: " + wp.Name, true);
+				wp.OnCompletion?.Invoke(pc);
+				pc.TriggerService.TryTriggerNamedTimer(wp.Name + ".OnComplete");
+				if ((waypoints.Count > 0) && (current.Value == wp) && (current.Next != null))
+				{
+					current = current.Next;
+					pc.SetState(PillockController.State.WP);
+					current.Value.Init(pc, getTick());
+				}
+			}
+			public void ForceSpecificWp(string name)
+			{
+				var wp = waypoints.FirstOrDefault(w => w.Name == name);
+				if (wp != null)
+				{
+					pc.SetState(PillockController.State.WP);
+					current = waypoints.Find(wp);
+					current.Value.Init(pc, getTick());
+				}
+			}
+			public void RemoveWp(Waypoint wp)
+			{
+				waypoints.Remove(wp);
+			}
+		}
+
+		class ThrusterSelector
+		{
+			public IMyGridTerminalSystem gts;
+			IMyRemoteControl rc;
+
+			public List<IAccelerator> current;
+
+			public List<IAccelerator> _FacingBackward;
+			public List<IAccelerator> _FacingForward;
+			public List<IAccelerator> _FacingVentral;
+			public List<IAccelerator> _FacingDorsal;
+			public List<IAccelerator> _FacingLeft;
+			public List<IAccelerator> _FacingRight;
+
+			double fovCapacity;
+			double backCapacity;
+			double upCapacity;
+			double downCapacity;
+			double leftCapacity;
+			double rightCapacity;
+
+			bool released;
+			public void Shutdown()
+			{
+				if (!released)
+				{
+					_FacingBackward.ForEach(a => a.SetPow(0));
+					_FacingForward.ForEach(a => a.SetPow(0));
+					_FacingVentral.ForEach(a => a.SetPow(0));
+					_FacingDorsal.ForEach(a => a.SetPow(0));
+					_FacingLeft.ForEach(a => a.SetPow(0));
+					_FacingRight.ForEach(a => a.SetPow(0));
+					released = true;
+				}
+			}
+
+			public BoundingBoxD GetCapacityBB(float mass)
+			{
+				Vector3D min = new Vector3D(-rightCapacity, -downCapacity, -backCapacity) / mass;
+				Vector3D max = new Vector3D(leftCapacity, upCapacity, fovCapacity) / mass;
+
+				return new BoundingBoxD(min, max);
+			}
+
+			void CalculateForces()
+			{
+				fovCapacity = FacingBackward().TotalForce();
+				backCapacity = FacingForward().TotalForce();
+				upCapacity = FacingVentral().TotalForce();
+				downCapacity = FacingDorsal().TotalForce();
+				leftCapacity = FacingRight().TotalForce();
+				rightCapacity = FacingLeft().TotalForce();
+			}
+
+			public ThrusterSelector(IMyTerminalBlock forwardFacingBlock, IMyGridTerminalSystem gts, IMyRemoteControl remCon, Func<IMyTerminalBlock, bool> filter)
+			{
+				this.gts = gts;
+				rc = remCon;
+				MatrixD wm = forwardFacingBlock.WorldMatrix;
+
+				Func<Vector3D, List<IAccelerator>> getT = fw =>
+				{
+					var r = new List<IMyThrust>();
+					gts.GetBlocksOfType(r, b => filter(b) && fw == b.WorldMatrix.Forward);
+					return r.Select(t => new ThrusterAccelerator(t)).Cast<IAccelerator>().ToList();
+				};
+
+				_FacingBackward = getT(wm.Backward);
+				_FacingForward = getT(wm.Forward);
+				_FacingVentral = getT(wm.Down);
+				_FacingDorsal = getT(wm.Up);
+				_FacingLeft = getT(wm.Left);
+				_FacingRight = getT(wm.Right);
+
+				var mms = new List<IMyArtificialMassBlock>();
+				gts.GetBlocksOfType(mms, b => filter(b));
+
+				string tag = Variables.Get<string>("ggen-tag");
+				Func<Vector3D, bool, List<IAccelerator>> addGg = (fw, inv) =>
+				{
+					var g = new List<IMyGravityGenerator>();
+					if (!string.IsNullOrEmpty(tag))
+					{
+						var gr = gts.GetBlockGroupWithName(tag);
+						if (gr != null)
+							gr.GetBlocksOfType(g, b => filter(b) && fw == b.WorldMatrix.Up);
+					}
+					else
+						gts.GetBlocksOfType(g, b => filter(b) && fw == b.WorldMatrix.Up);
+					return g.Select(p => new GravPairAccelerator(p, mms, inv)).Cast<IAccelerator>().ToList();
+				};
+
+				_FacingBackward.AddRange(addGg(wm.Forward, true));
+				_FacingForward.AddRange(addGg(wm.Forward, false));
+
+				_FacingBackward.AddRange(addGg(wm.Backward, false));
+				_FacingForward.AddRange(addGg(wm.Backward, true));
+
+				_FacingVentral.AddRange(addGg(wm.Up, true));
+				_FacingDorsal.AddRange(addGg(wm.Up, false));
+
+				_FacingVentral.AddRange(addGg(wm.Down, false));
+				_FacingDorsal.AddRange(addGg(wm.Down, true));
+
+				_FacingLeft.AddRange(addGg(wm.Right, true));
+				_FacingRight.AddRange(addGg(wm.Right, false));
+
+				_FacingLeft.AddRange(addGg(wm.Left, false));
+				_FacingRight.AddRange(addGg(wm.Left, true));
+
+				CalculateForces();
+			}
+
+			public ThrusterSelector FacingBackward()
+			{
+				current = _FacingBackward;
+				return this;
+			}
+			public ThrusterSelector FacingForward()
+			{
+				current = _FacingForward;
+				return this;
+			}
+			public ThrusterSelector FacingVentral()
+			{
+				current = _FacingVentral;
+				return this;
+			}
+			public ThrusterSelector FacingDorsal()
+			{
+				current = _FacingDorsal;
+				return this;
+			}
+			public ThrusterSelector FacingLeft()
+			{
+				current = _FacingLeft;
+				return this;
+			}
+			public ThrusterSelector FacingRight()
+			{
+				current = _FacingRight;
+				return this;
+			}
+			public void SetOverride(Vector3D v, float mass)
+			{
+				released = false;
+				Func<IAccelerator, bool> filter = a => !(a is GravPairAccelerator);
+				if (v.Z > 0)
+				{
+					var pow = v.Z / fovCapacity * mass;
+					FacingForward().SetPow(0, filter);
+					FacingBackward().SetPow(pow);
+				}
+				else
+				{
+					var pow = Math.Abs(v.Z) / backCapacity * mass;
+					FacingBackward().SetPow(0, filter);
+					FacingForward().SetPow(pow);
+				}
+				if (v.Y > 0)
+				{
+					var pow = v.Y / upCapacity * mass;
+					FacingDorsal().SetPow(0, filter);
+					FacingVentral().SetPow(pow);
+				}
+				else
+				{
+					var pow = Math.Abs(v.Y) / downCapacity * mass;
+					FacingVentral().SetPow(0, filter);
+					FacingDorsal().SetPow(pow);
+				}
+				if (v.X > 0)
+				{
+					var pow = v.X / leftCapacity * mass;
+					FacingLeft().SetPow(0, filter);
+					FacingRight().SetPow(pow);
+				}
+				else
+				{
+					var pow = Math.Abs(v.X) / rightCapacity * mass;
+					FacingRight().SetPow(0, filter);
+					FacingLeft().SetPow(pow);
+				}
+			}
+			public bool SetPow(double? powerQuotient = null, Func<IAccelerator, bool> filter = null)
+			{
+				if (current != null)
+				{
+					foreach (var accelerator in filter == null ? current : current.Where(filter))
+					{
+						accelerator.SetPow(powerQuotient);
+					}
+				}
+				current = null;
+				return true;
+			}
+			public float TotalForce()
+			{
+				float result = 0;
+				if (current != null)
+				{
+					foreach (var accelerator in current)
+					{
+						result += accelerator.EffectiveForce();
+					}
+				}
+				current = null;
+				return result;
+			}
+		}
+
+		class GravPairAccelerator : IAccelerator
+		{
+			IMyGravityGenerator g;
+			List<IMyArtificialMassBlock> mss;
+			bool negative;
+			public GravPairAccelerator(IMyGravityGenerator g, List<IMyArtificialMassBlock> mss, bool negative)
+			{
+				this.g = g;
+				this.mss = mss;
+				this.negative = negative;
+			}
+
+			public bool SetPow(double? powerQuotient = null)
+			{
+				if ((!powerQuotient.HasValue) || (powerQuotient.Value > 1))
+					powerQuotient = 1;
+				if ((powerQuotient == 0) || (powerQuotient == Double.NaN))
+				{
+					g.GravityAcceleration = 0;
+				}
+				else
+				{
+					g.GravityAcceleration = (float)(negative ? -powerQuotient.Value * G : powerQuotient.Value * G);
+				}
+				return true;
+			}
+
+			public float EffectiveForce()
+			{
+				return mss.Count * 50000 * G / 1.8f; // хз
+			}
+		}
+
+		class ThrusterAccelerator : IAccelerator
+		{
+			IMyThrust t;
+			public ThrusterAccelerator(IMyThrust t)
+			{
+				this.t = t;
+			}
+			public bool SetPow(double? powerQuotient = null)
+			{
+				if ((!powerQuotient.HasValue) || (powerQuotient.Value > 1))
+					powerQuotient = 1;
+				if (powerQuotient == 0)
+				{
+					t.SetValueFloat("Override", 0f);
+				}
+				else
+				{
+					t.SetValueFloat("Override", (float)powerQuotient.Value * t.MaxThrust);
+				}
+				return true;
+			}
+			public float EffectiveForce()
+			{
+				return t.MaxEffectiveThrust;
+			}
+		}
+
+		interface IAccelerator
+		{
+			bool SetPow(double? powerQuotient = null);
+			float EffectiveForce();
+		}
+
+		/// feedback msg stuff
+		/// 
+		static IMyTextSurface panel;
+		static IFeedbackWriter logger;
+		static void InitLogger(IFeedbackWriter writer)
+		{
+			logger = writer;
+		}
+
+		static StringBuilder sb = new StringBuilder(2048);
+		static void SendFeedback(string message, bool log = false)
+		{
+			if (log)
+			{
+				if (logger != null)
+				{
+					logger.WritePublicText(DateTime.Now.ToString("hh:mm:ss ") + message);
+				}
+			}
+			else
+			{
+				if (panel != null)
+					sb.AppendLine(message);
+			}
+		}
+		void FlushFeedbackBuffer()
+		{
+			if (sb.Length > 0)
+			{
+				panel.WriteText(sb.ToString());
+				sb.Clear();
+			}
+		}
+
+		void SendFeedback(StringBuilder sb, bool log)
+		{
+			SendFeedback(sb.ToString(), log);
+		}
+
+		interface IFeedbackWriter
+		{
+			void WritePublicText(string message);
+			void ClearAllText();
+		}
+
+		class RollingAppender : IFeedbackWriter
+		{
+			List<IMyTextPanel> panels;
+			int maxLinesCount;
+			int? maxCharsPerLine;
+			public RollingAppender(List<IMyTextPanel> panels, int maxLinesCount, int? maxCharsPerLine = null, Action<List<IMyTextPanel>> configurator = null)
+			{
+				this.maxLinesCount = maxLinesCount;
+				this.panels = panels;
+				this.maxCharsPerLine = maxCharsPerLine;
+				configurator?.Invoke(this.panels);
+			}
+			void Push(string message)
+			{
+				foreach (IMyTextPanel outputPanel in panels)
+				{
+					var str = outputPanel.GetText().TrimEnd('\n');
+					string[] currentlySavedLines = str.Split('\n');
+					int availableLinesCount = maxLinesCount - currentlySavedLines.Length;
+					string[] messageLines = message.TrimEnd('\n').Split('\n');
+
+					List<string> csLines = currentlySavedLines.ToList();
+					List<string> linesTW = messageLines.ToList();
+					csLines.AddRange(linesTW);
+					availableLinesCount -= messageLines.Length;
+					StringBuilder sb = new StringBuilder();
+					for (int n = 0; n < csLines.Count; n++)
+					{
+						if (availableLinesCount < 0)
+						{
+							availableLinesCount++;
+							continue;
+						}
+						sb.Append(csLines[n] + "\n");
+					}
+					outputPanel.WriteText(sb.ToString());
+				}
+			}
+
+			public void WritePublicText(string message)
+			{
+				if (maxCharsPerLine.HasValue)
+				{
+					message = string.Join("\n", Wrap(message.Trim('\n'), maxCharsPerLine.Value));
+				}
+				Push(message);
+			}
+
+			public void ClearAllText()
+			{
+				foreach (IMyTextPanel outputPanel in panels)
+				{
+					outputPanel.WriteText(string.Empty);
+				}
+			}
+		}
+
+		static List<String> Wrap(string text, int maxLength)
+		{
+			if (text.Length == 0) return new List<string>();
+			var words = text.Split(' ');
+			var lines = new List<string>();
+			var currentLine = "";
+			foreach (var currentWord in words)
+			{
+				if ((currentLine.Length > maxLength) || ((currentLine.Length + currentWord.Length) > maxLength))
+				{
+					lines.Add(currentLine);
+					currentLine = "";
+				}
+				if (currentLine.Length > 0)
+					currentLine += " " + currentWord;
+				else
+					currentLine += currentWord;
+			}
+			if (currentLine.Length > 0)
+				lines.Add(currentLine);
+			return lines;
+		}
+
+		AgentType MeType = AgentType.Unknown;
+		string ParentEntityID;
+		bool HaveRole(AgentType role)
+		{
+			return (MeType & role) == role;
+		}
+		void InitMeIdentity()
+		{
+			var parts = Me.CustomName.Trim().Split('[').Select(p => p.Trim(']'));
+			foreach (var p in parts)
+			{
+				if (p.Contains("clock"))
+				{
+					string[] pair = p.Split('=');
+					this.Clock = int.Parse(pair[1]);
+				}
+				if (p == "host")
+					MeType |= AgentType.Host;
+				if (p == "drone")
+					MeType |= AgentType.Drone;
+				if (p == "missile")
+					MeType |= AgentType.Missile;
+			}
+
+			this.ParentEntityID = Me.EntityId.ToString();
+		}
+		enum AgentType
+		{
+			Unknown = 1,
+			Host = 2,
+			Drone = 4,
+			Missile = 8
+		}
+
+		void BroadcastMessage(string msg, BroadcastSelector selector)
+		{
+			if (selector.ID != 0)
+				BroadcastMessage(msg, AgentType.Unknown, selector.ID);
+			else
+				BroadcastMessage(msg, selector.Type);
+		}
+		void BroadcastMessage(string message, AgentType? types = null, params long[] ids)
+		{
+			message = WrapMessageFor(types, ids) + message;
+			waitingMessages.Add(message);
+			if (!message.Contains("set-vec"))
+				SendFeedback("Sending: " + message, true);
+		}
+		int sentMsgCount = 0;
+
+		class IncomingMessage
+		{
+			public string Msg { get; set; }
+			public string From { get; set; }
+		}
+		IEnumerable<IncomingMessage> ParseMessage(string msg)
+		{
+			var items = msg.Split(new[] { "],[" }, StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim('[', ']')).ToList();
+			foreach (var item in items)
+			{
+				if (item.StartsWith("{"))
+				{
+					string[] parts = item.Split('}');
+					string body = parts[1];
+					string headers = parts[0].TrimStart('{');
+					string from = "";
+
+					bool itsForMe = true;
+					foreach (var pair in headers.Split(','))
+					{
+						var keyVal = pair.Split(':');
+						if (keyVal[0].Trim() == "recipient-types")
+						{
+							itsForMe = false;
+							foreach (string recipient in keyVal[1].Split('+'))
+							{
+								AgentType t;
+								Enum.TryParse(recipient.Trim(), out t);
+								if (HaveRole(t))
+									itsForMe = true;
+							}
+						}
+						if (keyVal[0].Trim() == "recipient-ids")
+						{
+							itsForMe = false;
+							foreach (string recipient in keyVal[1].Split('+'))
+							{
+								if (recipient.Trim() == ParentEntityID)
+									itsForMe = true;
+							}
+						}
+						if (keyVal[0].Trim() == "sender-id")
+						{
+							from = keyVal[1].Trim();
+						}
+					}
+
+					if (itsForMe)
+					{
+						// костылюга
+						if (!body.Contains("set-vec"))
+							SendFeedback("Received message from " + from, true);
+						yield return new IncomingMessage { Msg = body, From = from };
+					}
+					else
+					{
+						yield return new IncomingMessage();
+					}
+				}
+				else
+				{
+					yield return new IncomingMessage { Msg = item };
+				}
+			}
+		}
+		string WrapMessageFor(AgentType? types = null, params long[] ids)
+		{
+			StringBuilder sb = new StringBuilder();
+			sb.Append('{');
+			List<string> headerPairs = new List<string>();
+
+			List<string> roles = new List<string>();
+			var values = Enum.GetValues(typeof(AgentType)).Cast<AgentType>();
+			if (types.HasValue)
+			{
+				foreach (var agentType in values)
+				{
+					if ((types & agentType) == agentType)
+						roles.Add(agentType.ToString());
+				}
+			}
+			if (roles.Count > 0)
+				headerPairs.Add("recipient-types:" + string.Join("+", roles));
+			if (ids.Length > 0)
+				headerPairs.Add("recipient-ids:" + string.Join("+", ids));
+
+			headerPairs.Add("sender-id:" + IGC.Me);
+			return "{" + string.Join(", ", headerPairs) + "}";
+		}
+
+		BroadcastSelector broadcastSelector = new BroadcastSelector { Type = AgentType.Drone | AgentType.Host | AgentType.Missile };
+		class BroadcastSelector
+		{
+			public AgentType Type { get; set; }
+			public long ID { get; set; }
+		}
+
+		List<string> waitingMessages = new List<string>();
+		void FlushMessages()
+		{
+			if (waitingMessages.Any())
+			{
+				var res = string.Join(",", waitingMessages.Select(s => "[" + s + "]"));
+				waitingMessages.Clear();
+				IGC.SendBroadcastMessage("apck.command", res, TransmissionDistance.TransmissionDistanceMax);
+			}
+		}
+
+		List<IMyShipConnector> dockingPoints = new List<IMyShipConnector>();
+
+		///
+
+		CIWS ciws;
+		class CIWS
+		{
+			IMyProgrammableBlock pbCIWS;
+			Func<string> headers;
+			Func<int> getTick;
+			public CIWS(IMyProgrammableBlock pb, Func<string> createHeaders, Func<int> tickCountGetter)
+			{
+				pbCIWS = pb;
+				headers = createHeaders;
+				getTick = tickCountGetter;
+			}
+			int tickTimestamp;
+			public void CiwsIntercept(TargetTelemetry t)
+			{
+				if (pbCIWS != null)
+				{
+					var msg = string.Format("command:set-vectors:{0}", VectorOpsHelper.V3DtoBroadcastString(t.Position.Value, t.Velocity.Value));
+					pbCIWS.TryRun(headers() + msg);
+					tickTimestamp = getTick();
+				}
+			}
+			public bool Reset()
+			{
+				if (pbCIWS != null)
+				{
+					var msg = "command:set-vectors:invalidate";
+					return pbCIWS.TryRun(headers() + msg);
+				}
+				return false;
+			}
+		}
+
+		static class UserCtrlTest
+		{
+			static List<IMyShipController> ctrls;
+			public static void Init(List<IMyShipController> c)
+			{
+				ctrls = c;
+			}
+			public static Vector3 GetUserCtrlVector(MatrixD fwRef)
+			{
+				Vector3 res = new Vector3();
+				var c = ctrls.Where(x => x.IsUnderControl).FirstOrDefault();
+				if (c != null)
+				{
+					res = c.MoveIndicator * 1000;
+					res.X = -res.X;
+					res.Z = -res.Z;
+					if (fwRef != c.WorldMatrix)
+					{
+						var wC = Vector3D.TransformNormal(res, fwRef);
+						res = Vector3D.TransformNormal(wC, MatrixD.Transpose(c.WorldMatrix));
+					}
+				}
+
+				return res;
+			}
+		}
+
+		///
+
+		public static class E
+		{
+			static string debugTag = "";
+			static Action<string> e;
+			static IMyTextPanel p;
+			public static void Init(Action<string> echo, IMyGridTerminalSystem g)
+			{
+				e = echo;
+				p = g.GetBlockWithName("LCD Debug") as IMyTextPanel;
+			}
+			public static void Echo(string s) { if ((debugTag == "") || (s.Contains(debugTag))) e(s); }
+
+			static string buff = "";
+			public static void DebugToPanel(string s)
+			{
+				if (p != null)
+					buff += s + "\n";
+			}
+
+			public static void FlushDebugPanel()
+			{
+				if (!string.IsNullOrEmpty(buff))
+				{
+					p.WriteText(buff);
+					buff = "";
+				}
+			}
+
+			static IMyCameraBlock debCam;
+			public static void I(IMyCameraBlock c) { debCam = c; }
+			public static void R(Vector3D v)
+			{
+				if (debCam != null)
+					debCam.Raycast(v);
+			}
+		}

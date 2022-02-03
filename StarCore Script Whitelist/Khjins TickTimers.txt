@@ -1,0 +1,654 @@
+//Original: https://steamcommunity.com/sharedfiles/filedetails/?id=2277626207
+
+/*
+ * R e a d m e
+ * -----------
+ * This script acts like in-game timers.
+ * 
+ * Checkout the script page for guides.
+ * 
+ * ====================================
+ *  DO NOT TOUCH STUFF BELOW THIS LINE
+ * ====================================
+ */
+
+const bool FIX_STORAGE = false;
+const bool DEBUG_MODE = false;
+
+// ==============================
+// DO NOT EDIT BEYOND THIS LINE
+// ==============================
+Dictionary<string, CompactTimer> timers = new Dictionary<string, CompactTimer>();
+bool isSetup = false;
+string errors = "";
+
+public Program()
+{
+    if (FIX_STORAGE)
+    {
+        Storage = "";
+        return;
+    }
+
+    Runtime.UpdateFrequency = UpdateFrequency.Update1;
+    if (Storage != string.Empty)
+    {
+        LoadTimers();
+    }
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if ((updateSource & (UpdateType.Trigger | UpdateType.Terminal)) > 0)
+    {
+        HandleCommand(argument);
+    }
+
+    LogDebug("Compact Timers v1.0", append: false);
+    LogDebug($"Script {(isSetup ? "is setup." : "is not setup.\n Run \"setup\" command.")}");
+
+    if (DEBUG_MODE)
+    {
+        foreach (CompactTimer timer in timers.Values)
+        {
+            LogDebug($"[ {timer.Name} ]");
+            LogDebug($"Max Ticks: {timer.MaxTicks}");
+            LogDebug($"Actions: {timer.ActionCount}");
+            LogDebug($"IsWorking: {timer.IsWorking}");
+            LogDebug($"IsCountingDown: {timer.IsCountingDown}\n");
+        }
+    }
+
+    if (isSetup && updateSource == UpdateType.Update1)
+    {
+        foreach (CompactTimer timer in timers.Values)
+        {
+            timer.Tick();
+        }
+    }
+
+    if (errors != string.Empty)
+    {
+        LogDebug("\nLast Error:");
+        LogDebug(errors);
+    }
+    PrintDebug();
+}
+
+void LoadTimers()
+{
+    timers.Clear();
+    string[] timerData = Storage.Split(new char[] { '@' }, StringSplitOptions.RemoveEmptyEntries);
+    foreach (string data in timerData)
+    {
+        CompactTimer timer = new CompactTimer(this, data.Trim());
+        if (!timer.IsEmpty && !timers.ContainsKey(timer.Name))
+        {
+            timers.Add(timer.Name, timer);
+        }
+    }
+    isSetup = true;
+}
+
+public void Save()
+{
+    Storage = string.Empty;
+    foreach (CompactTimer timer in timers.Values)
+    {
+        Storage += $"@{timer.ToStorageData()}\n";
+    }
+}
+
+void HandleCommand(string argument)
+{
+    if (argument == "setup")
+    {
+        ParseTimers();
+    }
+    else if (argument.Contains(","))
+    {
+        ParseCommand(argument, true);
+    }
+}
+
+bool HasTimer(string name)
+{
+    return timers.ContainsKey(name);
+}
+
+CompactTimer GetTimer(string name)
+{
+    return timers[name];
+}
+
+void ParseTimers()
+{
+    // Reset the storages
+    Storage = string.Empty;
+    timers.Clear();
+    errors = "";
+
+    string[] sections = Me.CustomData.Split(new char[] { '@' }, StringSplitOptions.RemoveEmptyEntries);
+    List<string> commandList = new List<string>();
+
+    foreach (string section in sections)
+    {
+        string[] lines = section.Trim().Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+        // Timer Properties
+        string name = "";
+        int maxTicks = 0;
+        string actionData = "";
+
+        foreach (string line in lines)
+        {
+            if (line.Contains(":"))
+            {
+                string[] parts = line.Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+                name = parts[0].Trim();
+                maxTicks = int.Parse(parts[1].Trim());
+                if(parts.Length == 3)
+                {
+                    string initCommand = parts[2].Trim();
+                    string[] initCommands = initCommand.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach(string command in initCommands)
+                    {
+                        commandList.Add($"{name},{command}");
+                    }
+                }
+            }
+            else if (line.Contains(","))
+            {
+                actionData += $"{line.Trim()}\n";
+            }
+        }
+
+        CompactTimer timer = new CompactTimer(this, name, maxTicks, actionData);
+        if (!timers.ContainsKey(name))
+        {
+            timers.Add(name, timer);
+        }
+    }
+
+    foreach(string command in commandList)
+    {
+        HandleCommand(command);
+    }
+
+    Save();
+    isSetup = true;
+}
+
+void ParseCommand(string argument, bool parentCommand = false)
+{
+    string[] parts = argument.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+    if (timers.ContainsKey(parts[0].Trim()))
+    {
+        CompactTimer timer = timers[parts[0].Trim()];
+        string command = parts[1].Trim().ToLower();
+        string commandError = "";
+
+        if (command == "triggernow")
+        {
+            timer.Trigger(parentCommand);
+        }
+        else if (command == "start")
+        {
+            timer.Start();
+        }
+        else if (command == "stop")
+        {
+            timer.Stop();
+        }
+        else if (command == "onoff_on")
+        {
+            timer.TurnOn();
+        }
+        else if (command == "onoff_off")
+        {
+            timer.TurnOff();
+        }
+        else
+        {
+            commandError = "Unknown command.\n";
+        }
+
+        errors += commandError;
+    }
+    else
+    {
+        errors += $"Timer \"{parts[0].Trim()}\" not found.\n";
+    }
+}
+
+class CompactTimer
+{
+    Program program = null;
+    TickTimer timer = null;
+    List<ActionEntry> actionEntries = new List<ActionEntry>();
+    List<IMyTerminalBlock> blocks = new List<IMyTerminalBlock>();
+    List<ITerminalProperty> props = new List<ITerminalProperty>();
+    List<string> skipTimers = new List<string>();
+
+    public CompactTimer(Program program, string name, int maxTicks, string actionData)
+    {
+        this.program = program;
+        Name = name;
+        timer = new TickTimer(maxTicks);
+        ActionData = actionData;
+        if (ParseActionData(ActionData))
+            IsEmpty = false;
+        else
+            IsEmpty = true;
+    }
+
+    public CompactTimer(Program program, string storageDataString)
+    {
+        //  0  :   1    :   2     :      3     :       4      :    5
+        // Name:MaxTicks:IsWorking:CurrentTicks:IsCountingDOwn:ActionData
+        string[] data = storageDataString.Split(new char[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+        this.program = program;
+
+        Name = data[0];
+        IsWorking = bool.Parse(data[2]);
+        ActionData = data[5];
+        int maxTicks = int.Parse(data[1]);
+        int currTicks = int.Parse(data[3]);
+        bool isCountingDown = bool.Parse(data[4]);
+        timer = new TickTimer(maxTicks, currTicks);
+        IsEmpty = (!ParseActionData(ActionData));
+        if (isCountingDown)
+        {
+            timer.Resume();
+        }
+    }
+
+    public class ActionEntry
+    {
+        public IMyBlockGroup Group = null;
+        public IMyTerminalBlock Block = null;
+        public string TargetName = "";
+        public string ActionName = "";
+    }
+
+    private bool ParseActionData(string actionData)
+    {
+        string[] actions = actionData.Split(new char[] { '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (string action in actions)
+        {
+            ActionEntry newEntry = new ActionEntry();
+            string[] parts = action.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 2)
+            {
+                newEntry.TargetName = parts[0].Trim();
+                newEntry.ActionName = parts[1].Trim();
+                newEntry.Group = program.GridTerminalSystem.GetBlockGroupWithName(newEntry.TargetName);
+                newEntry.Block = program.GridTerminalSystem.GetBlockWithName(newEntry.TargetName);
+                actionEntries.Add(newEntry);
+            }
+        }
+        return (actionEntries.Count > 0);
+    }
+
+    public void TurnOn()
+    {
+        IsWorking = true;
+    }
+
+    public void TurnOff()
+    {
+        IsWorking = false;
+    }
+
+    public void Trigger(bool parentTrigger = false)
+    {
+        if (!IsWorking)
+            return;
+        Stop();
+
+        // Take note of inactive timers
+        if(parentTrigger)
+        {
+            skipTimers.Clear();
+            foreach (ActionEntry actionEntry in actionEntries)
+            {
+                if(actionEntry.Group == null
+                && actionEntry.Block == null
+                && program.HasTimer(actionEntry.TargetName))
+                {
+                    CompactTimer timer = program.GetTimer(actionEntry.TargetName);
+                    if(!timer.IsWorking)
+                    {
+                        skipTimers.Add(actionEntry.TargetName);
+                    }
+                }
+            }
+        }
+
+        foreach (ActionEntry actionEntry in actionEntries)
+        {
+            if (actionEntry.Group != null)
+            {
+                actionEntry.Group.GetBlocks(blocks, b => b.IsWorking == true);
+                foreach (IMyTerminalBlock block in blocks)
+                {
+                    DoAction(block, actionEntry.ActionName);
+                }
+            }
+            else if (actionEntry.Block != null)
+            {
+                DoAction(actionEntry.Block, actionEntry.ActionName);
+            }
+            else
+            {
+                if (program.HasTimer(actionEntry.TargetName))
+                {
+                    if (parentTrigger && skipTimers.Contains(actionEntry.TargetName))
+                    {
+                        if (actionEntry.ActionName.ToLower().StartsWith("onoff"))
+                        {
+                            program.ParseCommand($"{actionEntry.TargetName},{actionEntry.ActionName}");
+                        }
+                    }
+                    else
+                    {
+                        program.ParseCommand($"{actionEntry.TargetName},{actionEntry.ActionName}");
+                    }
+                }
+            }
+        }
+    }
+
+    private void DoAction(IMyTerminalBlock block, string action)
+    {
+        if (block.HasAction(action))
+        {
+            block.ApplyAction(action);
+        }
+        else
+        {
+            DoCustomAction(block, action);
+        }
+    }
+
+    public bool Tick()
+    {
+        if (!IsWorking)
+            return false;
+
+        if (timer.IsCountingDown)
+        {
+            timer.Tick();
+            return false;
+        }
+        if (timer.Elapsed)
+        {
+            Trigger(true);
+            return true;
+        }
+        return false;
+    }
+
+    public void Start()
+    {
+        timer.Start();
+    }
+
+    public void Stop()
+    {
+        timer.Stop();
+    }
+
+    public string ToStorageData()
+    {
+        //  0  :   1    :   2     :      3     :       4      :    5
+        // Name:MaxTicks:IsWorking:CurrentTicks:IsCountingDOwn:ActionData
+        string data = $"{Name}:{timer.MaxTicks}:{IsWorking}:{timer.CurrentTicks}:{timer.IsCountingDown}:{ActionData}";
+        return data;
+    }
+
+    public string Name { get; private set; } = "";
+
+    public string ActionData { get; private set; } = "";
+
+    public bool IsEmpty { get; private set; } = false;
+
+    public bool IsWorking { get; private set; } = true;
+
+    public bool IsCountingDown
+    {
+        get { return timer.IsCountingDown; }
+    }
+
+    public int CurrentTicks
+    {
+        get { return timer.CurrentTicks; }
+    }
+
+    public int ActionCount
+    {
+        get { return actionEntries.Count; }
+    }
+
+    public int MaxTicks
+    {
+        get { return timer.MaxTicks; }
+    }
+
+
+    private void DoCustomAction(IMyTerminalBlock block, string actionName)
+    {
+        if (actionName == "ShareInertiaTensorOnOff_On")
+            ShareInertiaTensorOnOff_On(block);
+        else if (actionName == "ShareInertiaTensorOnOff_Off")
+            ShareInertiaTensorOnOff_Off(block);
+        else if (block is IMyMotorStator)
+        {
+            if (actionName == "RotorLockOnOff_On")
+                RotorLockOnOff_On(block);
+            else if (actionName == "RotorLockOnOff_Off")
+                RotorLockOnOff_Off(block);
+            else if (actionName == "RotatePositive")
+                RotatePositive(block);
+            else if (actionName == "RotateNegative")
+                RotateNegative(block);
+            else if (actionName == "ResetRPM")
+                ResetRPM(block);
+            else if (actionName == "IncreaseRPM")
+                IncreaseRPM(block);
+            else if (actionName == "DecreaseRPM")
+                DecreaseRPM(block);
+        }
+        else
+            return;
+    }
+
+    private void ShareInertiaTensorOnOff_On(IMyTerminalBlock block)
+    {
+        block.GetProperties(props, p => p.Id == "ShareInertiaTensor");
+        foreach (ITerminalProperty prop in props)
+        {
+            prop.AsBool().SetValue(block, true);
+            break;
+        }
+    }
+
+    private void ShareInertiaTensorOnOff_Off(IMyTerminalBlock block)
+    {
+        block.GetProperties(props, p => p.Id == "ShareInertiaTensor");
+        foreach (ITerminalProperty prop in props)
+        {
+            prop.AsBool().SetValue(block, false);
+            break;
+        }
+    }
+
+    private void RotorLockOnOff_On(IMyTerminalBlock block)
+    {
+        (block as IMyMotorStator).RotorLock = true;
+    }
+
+    private void RotorLockOnOff_Off(IMyTerminalBlock block)
+    {
+        (block as IMyMotorStator).RotorLock = false;
+    }
+
+    private void RotatePositive(IMyTerminalBlock block)
+    {
+        IMyMotorStator motor = block as IMyMotorStator;
+        if (motor.TargetVelocityRPM < 0)
+            motor.TargetVelocityRPM *= -1;
+    }
+
+    private void RotateNegative(IMyTerminalBlock block)
+    {
+        IMyMotorStator motor = block as IMyMotorStator;
+        if (motor.TargetVelocityRPM > 0)
+            motor.TargetVelocityRPM *= -1;
+    }
+
+    private void ResetRPM(IMyTerminalBlock block)
+    {
+        IMyMotorStator motor = block as IMyMotorStator;
+        motor.TargetVelocityRPM = 0;
+    }
+
+    private void IncreaseRPM(IMyTerminalBlock block)
+    {
+        IMyMotorStator motor = block as IMyMotorStator;
+        motor.TargetVelocityRPM += 1;
+    }
+
+    private void DecreaseRPM(IMyTerminalBlock block)
+    {
+        IMyMotorStator motor = block as IMyMotorStator;
+        motor.TargetVelocityRPM -= 1;
+    }
+
+}
+
+// Khjin's Logging Functions v2.0 - 17/09/2020
+StringBuilder _debugLogs = new StringBuilder(string.Empty);
+StringBuilder _lcdLogs = new StringBuilder(string.Empty);
+
+void LogDebug(string message, bool newline = true, bool append = true)
+{
+    _Log(_debugLogs, message, newline, append);
+}
+
+void LogLCD(string message, bool newline = true, bool append = true)
+{
+    _Log(_lcdLogs, message, newline, append);
+}
+
+void _Log(StringBuilder log, string message, bool newline = true, bool append = true)
+{
+    if (append)
+        if (newline)
+            log.AppendLine(message);
+        else
+            log.Append(message);
+    else
+    { log.Clear(); log.AppendLine(message); }
+}
+
+void PrintDebug()
+{
+    Echo(_debugLogs.ToString());
+}
+
+void PrintLCD(IMyTextSurface surface)
+{
+    if (surface.GetText() != _lcdLogs.ToString())
+        surface.WriteText(_lcdLogs);
+}
+
+void ClearDebugLogs()
+{
+    _debugLogs.Clear();
+}
+
+void ClearLCDLogs()
+{
+    _lcdLogs.Clear();
+}
+
+/// <summary>
+        /// Khjin's Tick Timer v2.0
+        /// - Separated tick and elapse check for more flexibility
+        /// </summary>
+public class TickTimer
+{
+    private enum TimerStatus
+    {
+        Stopped,
+        CountingDown,
+        Paused
+    }
+    private TimerStatus status = TimerStatus.Stopped;
+
+    public TickTimer(int maxTicks, int currTicks = 0, int step = 1, bool loop=false)
+    {
+        MaxTicks = maxTicks;
+        CurrentTicks = currTicks;
+        Step = step;
+        Loop = loop;
+    }
+
+    public void Start()
+    {
+        Elapsed = false;
+        CurrentTicks = 0;
+        status = TimerStatus.CountingDown;
+    }
+
+    public void Stop()
+    {
+        Elapsed = false;
+        CurrentTicks = 0;
+        status = TimerStatus.Stopped;
+    }
+
+    public void Pause()
+    {
+        status = TimerStatus.Paused;
+    }
+
+    public void Resume()
+    {
+        status = TimerStatus.CountingDown;
+    }
+
+    public void Tick()
+    {
+        if (status == TimerStatus.CountingDown)
+        {
+            CurrentTicks += Step;
+            if (CurrentTicks < MaxTicks)
+            {
+                Elapsed = false;
+            }
+            else
+            {
+                Elapsed = true;
+                CurrentTicks = (Loop ? 0 : MaxTicks);
+                status = TimerStatus.Stopped;
+            }
+        }
+    }
+
+    public bool IsCountingDown
+    {
+        get { return (status == TimerStatus.CountingDown); }
+    }
+
+    public int MaxTicks { get; private set; } = 0;
+
+    public int CurrentTicks { get; private set; } = 0;
+
+    public int Step { get; private set; } = 0;
+
+    public bool Loop { get; private set; } = false;
+
+    public bool Elapsed { get; private set; } = false;
+}

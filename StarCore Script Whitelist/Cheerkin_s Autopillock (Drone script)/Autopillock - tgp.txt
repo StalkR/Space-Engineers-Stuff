@@ -1,0 +1,1444 @@
+
+		Func<int, int> RescanClock = c => c * 1;
+		Func<int, int> BroadcastClock = (c) => c * 1;
+		const float LockExpirSecs = 3f;
+		const bool BurstScanRecovery = true;
+
+		static class Variables
+		{
+			static Dictionary<string, object> v = new Dictionary<string, object> {
+				{ "turret-target-min-size", new Variable<double> { value = 0f, parser = s => double.Parse(s) } }
+			};
+			public static void Set(string key, string value) { (v[key] as ISettable).Set(value); }
+			public static void Set<T>(string key, T value) { (v[key] as ISettable).Set(value); }
+			public static T Get<T>(string key) { return (v[key] as ISettable).Get<T>(); }
+			public interface ISettable
+			{
+				void Set(string v);
+				T1 Get<T1>();
+				void Set<T1>(T1 v);
+			}
+			public class Variable<T> : ISettable where T : struct
+			{
+				public T value;
+				public Func<string, T> parser;
+				public void Set(string v) { value = parser(v); }
+				public void Set<T1>(T1 v) { value = (T)(object)v; }
+				public T1 Get<T1>() { return (T1)(object)value; }
+			}
+		}
+
+		public Program()
+		{
+			Runtime.UpdateFrequency = UpdateFrequency.Update1;
+			this.commandRegistry = new CommandRegistry(
+				new Dictionary<string, Action<string[]>>
+					{
+						{
+							"scan", (parts) => ScanCommandHandler(parts)
+						},
+						{
+							"set-vectors", (parts) => this.CurrentTargetVectors.ParseVectors(parts, this.tickCount)
+						},
+						{
+							"recycle", (parts) => Recycle(GridTerminalSystem)
+						},
+						{
+							"set-value", (parts) => Variables.Set(parts[2], parts[3])
+						},
+						{
+							"subscribe-local", (parts) =>
+							{
+								//var pb = GridTerminalSystem.GetBlockWithName(parts[2]) as IMyProgrammableBlock; // symbols [ and ] are screwed by msg command parser
+								List<IMyProgrammableBlock> pebes = new List<IMyProgrammableBlock>();
+								Func<IMyTerminalBlock, bool> checkGrid = b => Me.CubeGrid == b.CubeGrid;
+
+								GridTerminalSystem.GetBlocksOfType(pebes, b => checkGrid(b) && b.CustomName.Contains(parts[2]));
+								var pb = pebes.FirstOrDefault();
+
+								AddUniqueItem(pb, subscribers);
+							}
+						},
+						{
+							"add-panel", (parts) => AddUniqueItem(GridTerminalSystem.GetBlockWithName(parts[2]) as IMyTextPanel, panels)
+						},
+						{
+							"add-logger", (parts) => logger.AddPanel(GridTerminalSystem.GetBlockWithName(parts[2]) as IMyTextPanel)
+						}
+					}
+				);
+		}
+
+		static void AddUniqueItem<T>(T item, IList<T> c) where T: class
+		{
+			if ((item != null) && !c.Contains(item))
+				c.Add(item);
+		}
+
+		void Recycle(IMyGridTerminalSystem gts)
+		{
+			this.CurrentTargetVectors = new TargetTelemetry(Clock, "def TV");
+			this.TurretTargetVectors = new TargetTelemetry(Clock, "Turret");
+
+			this.subscribers = new List<IMyProgrammableBlock>();
+
+			// required
+			this.InitMeIdentity();
+			//this.forwardGyro = GetNamedSingleBlock<IMyGyro>("forward-gyro");
+
+			// optional
+			this.carrierRemCon = gts.GetBlockWithName("autopillock-remcon") as IMyRemoteControl;
+			this.coaxialCam = gts.GetBlockWithName("coaxial-cam") as IMyCameraBlock;
+			if (this.coaxialCam != null)
+				coaxialCam.EnableRaycast = true;
+			E.I(coaxialCam);
+			this.Cameras.ForEach(c => c.EnableRaycast = true);
+
+			TriggerService = new TimerTriggerService(gts);
+			gridSense = new GridSense(Cameras, coaxialCam, SendFeedback);
+
+			GridTerminalSystem.GetBlocksOfType(tDesigtators, b => b.CustomName.Contains("t-designator"));
+			tdm = new TargetDataManager(() => tickCount, carrierRemCon, gridSense.ScanFromTurret);
+
+			/* // greedy af
+			this.panel = gts.GetBlockWithName("MFD PHAR[autopillock]") as IMyTextPanel;
+			if (this.panel == null)
+			{
+				List<IMyTextPanel> blocks = new List<IMyTextPanel>();
+				gts.GetBlocksOfType(blocks);
+				if (blocks.Count > 0)
+					this.panel = blocks[0];
+			}*/
+
+			var logpanel = gts.GetBlockWithName("logpanel") as IMyTextPanel;
+			this.logger = new RollingAppender(maxLinesCount: 12, maxCharsPerLine: 65);
+			if (logpanel != null)
+				this.logger.AddPanel(logpanel);
+
+			turretGyro = null;
+			cams = null;
+			
+			if (!string.IsNullOrEmpty(Me.CustomData))
+				pendingInitSequence = true;
+		}
+
+		// ctor ends
+		bool constructed;
+		bool pendingInitSequence;
+
+		IMyCameraBlock coaxialCam;
+		int tickCount;
+		int Clock = 1;
+
+		IMyGyro turretGyro;
+		public IMyGyro TurretGyro
+		{
+			get
+			{
+				if (this.turretGyro == null)
+				{
+					this.turretGyro = GetNamedSingleBlock<IMyGyro>("turret-gyro");
+				}
+				return this.turretGyro;
+			}
+		}
+
+		List<IMyCameraBlock> cams;
+		public List<IMyCameraBlock> Cameras
+		{
+			get
+			{
+				if (this.cams == null)
+				{
+					var blocks = new List<IMyCameraBlock>();
+					GridTerminalSystem.GetBlocksOfType(blocks, block => block.CustomName.Contains("scan-array-cam"));
+					this.cams = blocks.ToList();
+					this.cams.ForEach(c => c.EnableRaycast = true);
+				}
+				return this.cams;
+			}
+		}
+
+		List<IMyLargeTurretBase> tDesigtators = new List<IMyLargeTurretBase>();
+
+		//IMyGyro forwardGyro;
+		IMyRemoteControl carrierRemCon;
+
+		T GetNamedSingleBlock<T>(string name) where T : class
+		{
+			T block = GridTerminalSystem.GetBlockWithName(name) as T;
+			if (block == null)
+				throw new Exception("Cant find the block named'" + name + "'");
+			return block;
+		}
+
+		public ToggleSwitches Toggle = new ToggleSwitches();
+		public class ToggleSwitches
+		{
+			Dictionary<string, bool> switches = new Dictionary<string, bool>
+				{
+					{ "lock-keep-alive", true },
+					{ "broadcast-vectors", true },
+					{ "turret-response", true },
+					{ "pirate-scan", true },
+					{ "debug-raycast", false },
+					{ "area-defence", false }
+				};
+			public void Set(string key, bool value)
+			{
+				this.switches[key] = value;
+			}
+			public void Invert(string key)
+			{
+				this.switches[key] = !this.switches[key];
+			}
+			public bool Check(string key)
+			{
+				return this.switches[key];
+			}
+		}
+
+		void OnToggleStateChange(string key)
+		{
+			switch (key)
+			{
+				case "broadcast-vectors":
+					if (!Toggle.Check("broadcast-vectors"))
+					{
+						if (TurretTargetVectors.Position.HasValue)
+							Invalidate(TurretTargetVectors);
+						if (CurrentTargetVectors.Position.HasValue)
+							Invalidate(CurrentTargetVectors);
+					}
+					break;
+			}
+		}
+
+		public TimerTriggerService TriggerService;
+		public class TimerTriggerService
+		{
+			IMyGridTerminalSystem gts;
+			Dictionary<string, IMyTimerBlock> triggers = new Dictionary<string, IMyTimerBlock>();
+			public TimerTriggerService(IMyGridTerminalSystem gts)
+			{
+				this.gts = gts;
+			}
+			public bool TryTriggerNamedTimer(string name)
+			{
+				IMyTimerBlock b;
+				if (!triggers.TryGetValue(name, out b))
+				{
+					b = gts.GetBlockWithName(name) as IMyTimerBlock;
+					if (b != null)
+						triggers.Add(name, b);
+					else
+						return false;
+				}
+				b.GetActionWithName("TriggerNow").Apply(b);
+				return true;
+			}
+		}
+
+		CommandRegistry commandRegistry;
+		public class CommandRegistry
+		{
+			Dictionary<string, Action<string[]>> commands;
+			public CommandRegistry(Dictionary<string, Action<string[]>> commands)
+			{
+				this.commands = commands;
+			}
+			public void RunCommand(string id, string[] cmdParts)
+			{
+				this.commands[id].Invoke(cmdParts);
+			}
+		}
+
+		void Main(string arg)
+		{
+			// because ctr runs when PB comes into existance, even if turned off
+			if (!constructed)
+			{
+				E.Init(Echo, GridTerminalSystem);
+				Recycle(GridTerminalSystem);
+				constructed = true;
+			}
+			this.tickCount++;
+			E.Echo("Starting tick " + this.tickCount);
+
+			if (pendingInitSequence && string.IsNullOrEmpty(arg))
+			{
+				pendingInitSequence = false;
+				arg = string.Join(",", Me.CustomData.Trim('\n').Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).Where(s => !s.StartsWith("//")).Select(s => "[" + s + "]"));
+			}
+			if (!string.IsNullOrEmpty(arg) && arg.Contains(":"))
+			{
+				var msgCollection = this.ParseMessage(arg).ToList();
+				foreach (var incomingMessage in msgCollection)
+				{
+					if (!string.IsNullOrEmpty(incomingMessage.From))
+					{
+						// with headers
+						string[] cmdParts = incomingMessage.Msg.Split(':');	 //handshake:greetings
+
+						arg = incomingMessage.Msg;
+					}
+					else
+						arg = incomingMessage.Msg;
+					if (!string.IsNullOrEmpty(arg))
+					{
+						string[] cmdParts = arg.Split(new[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+						if (cmdParts[0] == "toggle")
+						{
+							this.Toggle.Invert(cmdParts[1]);
+
+							OnToggleStateChange(cmdParts[1]);
+						}
+						if (cmdParts[0] == "command")
+						{
+							this.commandRegistry.RunCommand(cmdParts[1], cmdParts);
+						}
+					}
+				} // batched commands foreach ends
+			}
+
+			if ((this.tickCount % Clock) == 0)
+			{
+				if (this.Toggle.Check("pirate-scan") && (carrierRemCon != null))
+				{
+					Vector3D pPos = new Vector3D(550.33, -219.34, -3513.49);
+					if (carrierRemCon.GetNearestPlayer(out pPos))
+					{
+						if (this.CurrentTargetVectors.Position.HasValue)
+							this.CurrentTargetVectors.Velocity = (pPos - this.CurrentTargetVectors.Position.Value) / ((tickCount - this.CurrentTargetVectors.TickStamp) * Clock / 60f);
+						else
+							this.CurrentTargetVectors.Velocity = Vector3D.Zero;
+
+						this.CurrentTargetVectors.SetPosition(pPos, this.tickCount);
+
+						if (ScanLock == null)
+						{
+							var cam = gridSense.GetFirstSuitableCam(pPos);
+							if (cam != null)
+							{
+								var scan = gridSense.Scan(cam, pPos);
+								if (!scan.IsEmpty())
+								{
+									this.lastScannedInfo = scan;
+									this.ScanLock = new Lock(
+										this.lastScannedInfo,
+										(s, cat) =>
+										{
+											SendFeedback(s, cat);
+											//E.Echo(s);
+										},
+										gridSense,
+										//(info) => info.HitPosition.Value,
+										(info) => info.Position,
+										() => carrierRemCon != null ? this.carrierRemCon.GetShipVelocities().LinearVelocity : GetMyLinearVelocity(Me.GetPosition())
+									);
+								}
+							}
+						}
+					}
+				}
+
+				if (Toggle.Check("turret-response") && (tDesigtators.Count > 0))
+				{
+					if (Toggle.Check("area-defence"))
+						tdm.Update(x => (x.IsInertial.HasValue && !x.IsInertial.Value) || (x.AboutToViolateMySpace.HasValue && x.AboutToViolateMySpace.Value)); // as long as they fly into our sphere
+					else
+						tdm.Update(x => (x.TickEncountered < tickCount + 600) || !(x.IsInertial.HasValue && !x.IsInertial.Value)); // good for threat interrupt cqb
+					
+					foreach (var d in tDesigtators)
+					{
+						var i = d.GetTargetedEntity();
+						if (!i.IsEmpty())
+						{
+							if (!tdm.Consider(i))
+								d.ResetTargetingToDefault();
+						}
+					}
+
+					var t = tdm.GetTarget();
+
+					if (t != null)
+					{
+						MyDetectedEntityInfo info = t.Value;
+						TurretTargetVectors.SetPosition(info.Position, tickCount);
+						TurretTargetVectors.Velocity = info.Velocity;
+						TurretTargetVectors.Type = info.Type;
+					}
+					else
+					{
+						if (TurretTargetVectors.Position.HasValue)
+						{
+							TurretTargetVectors.Invalidate();
+							Invalidate(TurretTargetVectors);
+						}
+					}
+				}
+
+				if (this.Toggle.Check("lock-keep-alive"))
+				{
+					if (this.ScanLock == null)
+					{
+						if (!this.lastScannedInfo.IsEmpty())
+						{
+							this.ScanLock = new Lock(
+									this.lastScannedInfo,
+									(s, cat) =>
+									{
+										SendFeedback(s, cat);
+										//E.Echo(s);
+									},
+									gridSense,
+									(info) => info.Position,
+									() => carrierRemCon != null ? this.carrierRemCon.GetShipVelocities().LinearVelocity : GetMyLinearVelocity(Me.GetPosition())
+								);
+						}
+					}
+					else
+					{
+						if (this.tickCount % RescanClock(Clock) == 0)
+						{
+							if (this.ScanLock.Refresh(commandRegistry))
+							{
+								this.CurrentTargetVectors.SetPosition(ScanLock.RefreshPointer(ScanLock.Info.Value), this.tickCount);
+								this.CurrentTargetVectors.Velocity = this.ScanLock.Info.Value.Velocity;
+								this.CurrentTargetVectors.Type = this.ScanLock.Info.Value.Type;
+							}
+							else
+							{
+								if (this.ScanLock.Info == null)
+								{
+									this.ScanLock = null;
+									this.lastScannedInfo = new MyDetectedEntityInfo();
+									if (this.Toggle.Check("broadcast-vectors"))
+										Invalidate(this.CurrentTargetVectors);
+								}
+							}
+						}
+					}
+				}
+				else
+				{
+					this.ScanLock = null;
+				}
+
+				if ((this.Toggle.Check("broadcast-vectors") && (this.tickCount % BroadcastClock(Clock) == 0)))
+				{
+					if (this.CurrentTargetVectors.Position.HasValue && this.CurrentTargetVectors.Velocity.HasValue)
+					{
+						if (this.CurrentTargetVectors.TickStamp == tickCount)
+							Delegate(CurrentTargetVectors);
+					}
+					if (this.TurretTargetVectors.Position.HasValue && this.TurretTargetVectors.Velocity.HasValue)
+						Delegate(TurretTargetVectors);
+				}
+
+				NotifySubscribers();
+				E.FlushDebugPanel();
+				FlushFeedbackBuffer();
+			}
+
+			E.Echo("Subscribers: " + subscribers.Count);
+			E.Echo("PushedNotifications: " + metrics.PushedNotifications);
+
+			//this.CurrentTargetVectors.PredictPostion(this.tickCount, Clock);
+
+			E.Echo("ParseVectorsCount: " + metrics.ParseVectorsCount);
+			E.Echo("TVextrapolationsCount: " + metrics.TVextrapolationsCount);
+			E.Echo("ScanBurstsCount: " + metrics.ScanBurstsCount);
+			E.Echo("OutOfCameraSkippedScans: " + metrics.OutOfCameraSkippedScans);
+			E.Echo("CamLoadRate: " + metrics.CamLoadRate);
+
+			E.Echo("metrics.facingCams: " + metrics.facingCams);
+			E.Echo("metrics.readyCams: " + metrics.readyCams);
+
+			E.Echo("Processed in " + Runtime.LastRunTimeMs.ToString("f3") + " ms");
+			last100runs.Enqueue(Runtime.LastRunTimeMs);
+			if (last100runs.Count == 100)
+			{
+				double sum = 0;
+				foreach (var x in last100runs)
+					sum += x;
+				E.Echo("100 runs avg " + (sum / 100f).ToString("f3") + " ms");
+				last100runs.Dequeue();
+			}
+		}
+
+		Queue<double> last100runs = new Queue<double>();
+
+		TargetTelemetry DockingVectors { get; set; }
+		TargetTelemetry WingmanVectors { get; set; }
+		TargetTelemetry CurrentTargetVectors { get; set; }
+		TargetTelemetry TurretTargetVectors { get; set; }
+
+		public class TargetTelemetry
+		{
+			public int TickStamp;
+			int clock;
+			public string Name;
+			public Vector3D? Position { get; private set; }
+			public Vector3D? Velocity;
+			public Vector3D? Acceleration;
+			public MatrixD? OrientationUnit;
+			public BoundingBoxD? BoundingBox;
+			public MyDetectedEntityType? Type { get; set; }
+			public TargetTelemetry(int clock, string name)
+			{
+				Name = name;
+				this.clock = clock;
+			}
+			public void SetPosition(Vector3D pos, int tickStamp)
+			{
+				Position = pos;
+				TickStamp = tickStamp;
+			}
+			public void PredictPostion(int tick, int clock)
+			{
+				if ((Velocity.HasValue) && (Velocity.Value.Length() > double.Epsilon) && (tick - TickStamp) > 0)
+				{
+					Position += Velocity * (tick - TickStamp) * clock / 60;
+					metrics.TVextrapolationsCount++;
+				}
+			}
+			public void ParseVectors(string[] cmdString, int tickTimeStamp)
+			{
+				if (cmdString[2] == "invalidate")
+				{
+					Invalidate();
+				}
+				else
+				{
+					SetPosition(new Vector3D(
+					double.Parse(cmdString[2]), double.Parse(cmdString[3]), double.Parse(cmdString[4])), tickTimeStamp);
+					if (cmdString.Length > 5)
+					{
+						var newVel = new Vector3D(
+							double.Parse(cmdString[5]), double.Parse(cmdString[6]), double.Parse(cmdString[7]));
+						if (!Velocity.HasValue)
+							Velocity = newVel;
+						Acceleration = (newVel - Velocity.Value) * 60 / clock;
+						Velocity = newVel;
+					}
+					if (cmdString.Length > 8)
+					{
+						OrientationUnit = new MatrixD(
+								double.Parse(cmdString[8]), double.Parse(cmdString[9]), double.Parse(cmdString[10]), double.Parse(cmdString[11]),
+								double.Parse(cmdString[12]), double.Parse(cmdString[13]), double.Parse(cmdString[14]), double.Parse(cmdString[15]),
+								double.Parse(cmdString[16]), double.Parse(cmdString[17]), double.Parse(cmdString[18]), double.Parse(cmdString[19]),
+								double.Parse(cmdString[20]), double.Parse(cmdString[21]), double.Parse(cmdString[22]), double.Parse(cmdString[23])
+							);
+					}
+					if (cmdString.Length > 25)
+					{
+						BoundingBox = new BoundingBoxD(
+							new Vector3D(double.Parse(cmdString[24]), double.Parse(cmdString[25]), double.Parse(cmdString[26])),
+							new Vector3D(double.Parse(cmdString[27]), double.Parse(cmdString[28]), double.Parse(cmdString[29]))
+							);
+					}
+					if (cmdString.Length > 30)
+						Type = (MyDetectedEntityType)Enum.Parse(typeof(MyDetectedEntityType), cmdString[30]);
+
+					metrics.ParseVectorsCount++;
+				}
+			}
+			public void Invalidate()
+			{
+				Position = null;
+				Velocity = null;
+				OrientationUnit = null;
+				BoundingBox = null;
+			}
+		}
+
+		public static Metrics metrics;
+		public struct Metrics
+		{
+			public int ParseVectorsCount;
+			public int TVextrapolationsCount;
+			public int ScanBurstsCount;
+			public int OutOfCameraSkippedScans;
+			public string CamLoadRate;
+			public int facingCams;
+			public int readyCams;
+			public int PushedNotifications;
+		}
+
+		Vector3D? prevPos;
+		public Vector3D GetMyLinearVelocity(Vector3D currentPos)
+		{
+			Vector3D result;
+			if (!prevPos.HasValue)
+				result = new Vector3D();
+			else
+				result = (prevPos.Value - currentPos) * 60f / Clock;
+			prevPos = currentPos;
+			return result;
+		}
+
+		public Lock ScanLock { get; set; }
+		public class Lock
+		{
+			public MyDetectedEntityInfo? Info { get; private set; }
+			public DateTime TimeStamp { get; private set; }
+			Action<string, MessageCategories> sender;
+			//Func<Vector3D, MyDetectedEntityInfo?> scan;
+			// what position to raycast for lock update
+			public Func<MyDetectedEntityInfo, Vector3D> RefreshPointer;
+			int scanFwAddition = 20;
+			// grid local raycast hit position
+			public Vector3D? FirstScanHitPositionLocal;
+			private Func<Vector3D> Velocity;
+			private GridSense gridSense;
+			public Lock(
+				MyDetectedEntityInfo info,
+				Action<string, MessageCategories> sender,
+				GridSense gridSense,
+				Func<MyDetectedEntityInfo, Vector3D> refreshPointer, Func<Vector3D> velocityGetter)
+			{
+				this.sender = sender;
+				this.gridSense = gridSense;
+				this.RefreshPointer = refreshPointer;
+				this.Info = info;
+				this.TimeStamp = DateTime.Now;
+				this.Velocity = velocityGetter;
+				if (info.HitPosition.HasValue)
+				{
+					this.FirstScanHitPositionLocal = Vector3D.TransformNormal(info.HitPosition.Value - info.Position, MatrixD.Transpose(info.Orientation));
+				}
+			}
+			public bool Refresh(CommandRegistry c)
+			{
+				if (this.Info.HasValue && !this.Info.Value.IsEmpty())
+				{
+					var sb = new StringBuilder();
+					var age = DateTime.Now - this.TimeStamp;
+
+					if (age.TotalSeconds > LockExpirSecs)
+					{
+						this.sender(string.Format("Lock terminated, last scanned position: {0}", RefreshPointer(this.Info.Value).ToString("F1")), MessageCategories.Log);
+						//c.RunCommand("bc-wp-next", new string[] {});
+						this.Info = null;
+						return false;
+					}
+
+					Vector3D assumedPosition = RefreshPointer(this.Info.Value) + (this.Info.Value.Velocity * ((float)age.TotalSeconds));
+
+					var thisVel = Velocity();
+					float secs = (float)age.TotalSeconds;
+					assumedPosition = RefreshPointer(this.Info.Value) + (this.Info.Value.Velocity * secs) - (thisVel * secs);
+
+					// not very good
+					var nextCam = gridSense.GetFirstSuitableCam(assumedPosition);
+
+					if (nextCam == null)
+					{
+						metrics.OutOfCameraSkippedScans++;
+						return false;
+					}
+
+					sb.AppendFormat("Name: {0}, Type: {1}, ID: {2}", this.Info.Value.Name, this.Info.Value.Type, this.Info.Value.EntityId);
+					sb.AppendLine();
+					sb.AppendLine("Velocity: " + this.Info.Value.Velocity.Length().ToString("F2"));
+					sb.AppendLine("Lock age: " + age.TotalSeconds + "s");
+					sb.AppendLine("Raycast distance: " + Vector3D.Distance(nextCam.WorldMatrix.Translation, assumedPosition));
+					sb.AppendLine(string.Format("Autoscan to: {0}, {1}, {2}", assumedPosition.X.ToString("F1"), assumedPosition.Y.ToString("F1"), assumedPosition.Z.ToString("F1")));
+
+					var info = gridSense.ScanFromTurret(assumedPosition + (Vector3D.Normalize(assumedPosition - nextCam.WorldMatrix.Translation) * scanFwAddition));
+
+					if (info.HasValue && info.Value.HitPosition.HasValue && (info.Value.EntityId == this.Info.Value.EntityId))
+					{
+						this.Info = info;
+						this.TimeStamp = DateTime.Now;
+						sb.AppendLine(
+							string.Format("LOCK REFRESHED E-POS: {0}, {1}, {2}", info.Value.Position.X.ToString("F2"), info.Value.Position.Y.ToString("F2"), info.Value.Position.Z.ToString("F2")));
+						sb.AppendLine(
+							string.Format("LOCK REFRESHED H-POS: {0}, {1}, {2}", info.Value.HitPosition.Value.X.ToString("F2"), info.Value.HitPosition.Value.Y.ToString("F2"), info.Value.HitPosition.Value.Z.ToString("F2")));
+						this.sender(sb.ToString(), MessageCategories.Lock);
+						return true;
+					}
+					if (BurstScanRecovery)
+					{
+						metrics.ScanBurstsCount++;
+
+						double multiplier = 5;
+
+						double yMag = 0.3;
+						double[,] shiftedPairs = new double[,] { { 0, yMag }, { 0, -yMag }, { 1, yMag }, { 1, -yMag }, { -1, yMag }, { -1, -yMag } };
+						for (int mult = 1; mult < 4; mult++)
+							for (int n = 0; n < 6; n++)
+							{
+								double xShift = shiftedPairs[n, 0] * (multiplier + mult * 2);
+								double yShift = shiftedPairs[n, 1] * (multiplier + mult * 2);
+								Vector3D velNormX = Vector3D.Normalize(this.Info.Value.Velocity);
+								Vector3D velNormY = Vector3D.Normalize(Vector3D.Cross(velNormX, Vector3D.Normalize(assumedPosition - nextCam.WorldMatrix.Translation)));
+
+								Vector3D velCorrection = velNormX * xShift + velNormY * yShift;
+
+								Vector3D shiftedPosition = this.Info.Value.BoundingBox.Center + (this.Info.Value.Velocity * ((float)age.TotalSeconds)) + velCorrection;
+
+								info = gridSense.ScanFromTurret(shiftedPosition + (Vector3D.Normalize(assumedPosition - nextCam.WorldMatrix.Translation) * scanFwAddition));
+								if (info.HasValue && (info.Value.EntityId == this.Info.Value.EntityId))
+								{
+									this.Info = info;
+									this.TimeStamp = DateTime.Now;
+									sb.AppendLine(
+										string.Format(
+											"LOCK BURST REFRESHED AT: {0}, {1}, {2}", this.Info.Value.Position.X.ToString("F2"),
+											this.Info.Value.Position.Y.ToString("F2"), this.Info.Value.Position.Z.ToString("F2")));
+									this.sender(sb.ToString(), MessageCategories.Lock);
+									return true;
+								}
+							}
+					}
+				}
+				return false;
+			}
+		}
+
+		public void ScanCommandHandler(string[] cmdString)
+		{
+			var distance = 10000;
+			Vector3D position;
+
+			if (cmdString.Length > 2)
+				position = new Vector3D(double.Parse(cmdString[2]), double.Parse(cmdString[3]), double.Parse(cmdString[4]));
+			else
+				position = coaxialCam.GetPosition() + coaxialCam.WorldMatrix.Forward * distance;
+
+			this.ScanLock = null;
+			var info = gridSense.DesignationScan(coaxialCam, position);
+			if (info.HasValue)
+			{
+				var sb = new StringBuilder();
+				sb.AppendFormat("Name: {0}, Type: {1}, ID: {2}",
+						info.Value.Name, info.Value.Type, info.Value.EntityId);
+				sb.AppendLine();
+				if (info.Value.HitPosition.HasValue)
+				{
+					sb.AppendLine("Distance to surface: " + Vector3D.Distance(coaxialCam.GetPosition(), info.Value.HitPosition.Value).ToString("0.00"));
+					sb.AppendLine("Distance to center: " + Vector3D.Distance(coaxialCam.GetPosition(), info.Value.Position).ToString("0.00"));
+					sb.AppendLine("Timestamp: " + info.Value.TimeStamp);
+					this.lastScannedInfo = info.Value;
+					this.CurrentTargetVectors.SetPosition(info.Value.HitPosition.Value, this.tickCount);
+					SendFeedback(string.Format("Found surface at: {0} , speed: {1}", this.lastScannedInfo.HitPosition.Value.ToString("F1"), info.Value.Velocity.Length().ToString("F2")), MessageCategories.Log);
+				}
+				SendFeedback(sb, MessageCategories.ScanData);
+			}
+		}
+
+		GridSense gridSense;
+		public class GridSense
+		{
+			List<IMyCameraBlock> cams;
+			IMyCameraBlock coaxialCam;
+			Action<string, MessageCategories> sendFeedback;
+			public GridSense(List<IMyCameraBlock> camArray, IMyCameraBlock coaxialCam, Action<string, MessageCategories> sendFeedback)
+			{
+				cams = camArray;
+				this.sendFeedback = sendFeedback;
+				this.coaxialCam = coaxialCam;
+			}
+
+			public MyDetectedEntityInfo? DesignationScan(IMyCameraBlock coaxialCam, Vector3D position)
+			{
+				if (coaxialCam.CanScan(position))
+				{
+					var info = Scan(coaxialCam, position);
+					if (!info.IsEmpty())
+						return info;
+				}
+				sendFeedback("Designation coaxial cam is not ready", MessageCategories.ScanData);
+				return null;
+			}
+
+			public MyDetectedEntityInfo Scan(IMyCameraBlock cam, Vector3D pos)
+			{
+				//SendFeedback(string.Format("Scanning to: {0}, {1}, {2}", pos.X.ToString("F2"), pos.Y.ToString("F2"), pos.Z.ToString("F2")), MessageCategories.Log);
+				return cam.Raycast(pos);
+			}
+
+			public IMyCameraBlock GetFirstSuitableCam(Vector3D position)
+			{
+				Func<IMyTerminalBlock, bool> within45Cone = (b) =>
+				{
+					return Vector3D.Dot(Vector3D.Normalize(position - b.WorldMatrix.Translation), b.WorldMatrix.Forward) > 45f / 180f * Math.PI; // ~0.71
+				};
+				var facingCams = cams.Where(c => within45Cone(c));
+				var readyCams = cams.Where(c => c.CanScan(position));
+				metrics.facingCams = facingCams.Count();
+				metrics.readyCams = readyCams.Count();
+				if (facingCams.Count() > 0)
+				{
+					metrics.CamLoadRate = ((1 - (float)readyCams.Count() / facingCams.Count()) * 100).ToString("f1") + "%";
+					//sendFeedback("Cam array load rate: " + metrics.CamLoadRate, MessageCategories.ScanData);
+				}
+
+				var readyCam = readyCams.FirstOrDefault();
+				if (readyCam == null)
+				{
+					//sendFeedback("No ready scanners", MessageCategories.ScanData);
+					return null;
+				}
+				return readyCam;
+			}
+
+			public MyDetectedEntityInfo? ScanFromTurret(Vector3D position)
+			{
+				var readyCam = GetFirstSuitableCam(position);
+				if (readyCam == null)
+					return null;
+				return Scan(readyCam, position);
+			}
+		}
+
+		TargetDataManager tdm;
+		class TargetDataManager
+		{
+			Func<int> getTick;
+			IMyRemoteControl remCon;
+			Func<Vector3D, MyDetectedEntityInfo?> auxRaycast;
+			List<TrackedEntity> entities = new List<TrackedEntity>();
+
+			public class TrackedEntity
+			{
+				public long ID;
+				public double InitialSize;
+				public MyDetectedEntityInfo mdeiSnapshot;
+				public bool IsValid;
+				public bool Banned;
+				public bool? IsInertial;
+				public bool Expired;
+				public int TickUpdated;
+				public int TickEncountered;
+				public bool? AboutToViolateMySpace = null;
+				public void Actualize(MyDetectedEntityInfo newMdei, IMyRemoteControl r, int tick)
+				{
+					IsInertial = (newMdei.Velocity.Length() > 0) && (newMdei.Velocity == mdeiSnapshot.Velocity);
+					var bs = new BoundingSphereD(r.GetPosition(), 100);
+					AboutToViolateMySpace = (bs.Intersects(new RayD(newMdei.Position, Vector3D.Normalize(newMdei.Velocity))) != null);
+					mdeiSnapshot = newMdei;
+					TickUpdated = tick;
+				}
+				public override string ToString()
+				{
+					//return string.Format("ID: {0} Size: {1} Inert: {2} Intrusive: {3} Expired: {4} Valid: {5}",
+					//ID, InitialSize.ToString("F1"), IsInertial.HasValue ? IsInertial.ToString() : "?", AboutToViolateMySpace.HasValue ? AboutToViolateMySpace.ToString() : "?", Expired.ToString(), IsValid.ToString());
+					return string.Format("Sz: {0} In: {1} Exp: {2} Vld: {3}",
+						InitialSize.ToString("F1"), IsInertial.HasValue ? IsInertial.ToString() : "?", AboutToViolateMySpace.HasValue ? AboutToViolateMySpace.ToString() : "?", Expired.ToString(), IsValid.ToString());
+				}
+			}
+
+			public TargetDataManager(Func<int> tickCountGetter, IMyRemoteControl remoteControl, Func<Vector3D, MyDetectedEntityInfo?> r)
+			{
+				getTick = tickCountGetter;
+				remCon = remoteControl;
+				auxRaycast = r;
+			}
+
+			public bool Consider(MyDetectedEntityInfo info)
+			{
+				var tt = entities.FirstOrDefault(e => e.ID == info.EntityId);
+				if (tt == null)
+				{
+					var minS = Variables.Get<double>("turret-target-min-size");
+					var size = info.BoundingBox.Extents.Length();
+					var r = auxRaycast(info.Position);
+					if (r.HasValue)
+						size = r.Value.BoundingBox.Extents.Length();
+					tt = new TrackedEntity { ID = info.EntityId, mdeiSnapshot = info, InitialSize = size, IsValid = (minS == 0) || (size > minS), TickUpdated = getTick(), TickEncountered = getTick() };
+					tt.Banned = !tt.IsValid;
+					entities.Add(tt);
+				}
+				else
+				{
+					tt.Actualize(info, remCon, getTick());
+				}
+				return tt.IsValid;
+			}
+
+			public MyDetectedEntityInfo? GetTarget()
+			{
+				var t = entities.OrderByDescending(e => e.TickUpdated).FirstOrDefault(e => e.IsValid);
+				//var t = entities.Where(e => e.IsValid && !e.Banned).OrderByDescending(te => te.InitialSize).FirstOrDefault();
+				return t != null ? t.mdeiSnapshot : (MyDetectedEntityInfo?)null;
+			}
+
+			public void Update(Func<TrackedEntity, bool> predicate = null)
+			{
+				if (predicate == null)
+					predicate = (x) => true;
+				E.FlushDebugPanel();
+				var sb = new StringBuilder();
+				sb.AppendLine("TrackedEntity items:");
+				entities.RemoveAll(e => !e.Banned && (getTick() - e.TickUpdated > 600));
+				foreach (var e in entities)
+				{
+					e.Expired = getTick() - e.TickUpdated > 60;
+					e.IsValid = !e.Expired && predicate(e);
+					if ((e.TickEncountered > getTick() + 1200) && !predicate(e))
+						e.Banned = true;
+					e.IsValid = e.IsValid && !e.Banned;
+					sb.AppendLine(e.ToString());
+				}
+				E.DebugToPanel(sb.ToString());
+				E.FlushDebugPanel();
+			}
+		}
+
+		public static class VectorOpsHelper
+		{
+			public static string V3DtoBroadcastString(params Vector3D[] vectors)
+			{
+				return string.Join(":", vectors.Select(v => string.Format("{0}:{1}:{2}", v.X, v.Y, v.Z)));
+			}
+
+			public static string MtrDtoBroadcastString(MatrixD mat)
+			{
+				StringBuilder sb = new StringBuilder();
+				for (int i = 0; i < 4; i++)
+				{
+					for (int j = 0; j < 4; j++)
+					{
+						sb.Append(mat[i, j] + ":");
+					}
+				}
+				return sb.ToString().TrimEnd(':');
+			}
+
+			public static Vector3D GetPredictedImpactPoint(IMyTerminalBlock originBl, IMyRemoteControl remoteControl, Vector3D targetCenter, Vector3D targetVelocity, Vector3D munitionVel, bool compensateOwnVel)
+			{
+				// projection of munitionVel on target direction
+				double munitionSpeed = Vector3D.Dot(Vector3D.Normalize(targetCenter - originBl.GetPosition()), munitionVel);
+				if (munitionSpeed < 30)
+					munitionSpeed = 30;
+				return GetPredictedImpactPoint(originBl.GetPosition(), remoteControl.GetShipVelocities().LinearVelocity, targetCenter, targetVelocity, munitionSpeed, compensateOwnVel);
+			}
+
+			public static Vector3D GetPredictedImpactPoint(Vector3D origin, Vector3D originVel, Vector3D targetCenter, Vector3D targetVelocity, double munitionSpeed, bool compensateOwnVel)
+			{
+				double currentDistance = Vector3D.Distance(origin, targetCenter);
+				Vector3D target = targetCenter - origin;
+				Vector3D targetNorm = Vector3D.Normalize(target);
+				// if vel = 0 then target orientation is undetermined
+				double targAngle = 0;
+				double pipAngle = 0;
+				double s = 0;
+				Vector3D assumedPosition = targetCenter;
+
+				Vector3D velNorm;
+
+				if (compensateOwnVel)
+				{
+					// hmm.. take reject of selfvel from ray to pip and substract it from target vel?
+					var rej = Vector3D.Reject(originVel, targetNorm);
+					//assumedPosition -= rej * s;
+
+					//2nd ver
+					targetVelocity -= rej;
+				}
+
+				if (targetVelocity.Length() > float.Epsilon)
+				{
+					velNorm = Vector3D.Normalize(targetVelocity);
+					targAngle = Math.PI - Math.Acos(Vector3D.Dot(targetNorm, velNorm));
+					// this gets to NaN at values out of Asin range (-1;1)
+					// at some angles we just cant catch the target if it's faster
+					var y = (targetVelocity.Length() * Math.Sin(targAngle)) / munitionSpeed;
+					if (Math.Abs(y) <= 1)
+					{
+						pipAngle = Math.Asin(y);
+						s = currentDistance * Math.Sin(pipAngle) / Math.Sin(targAngle + pipAngle);
+						assumedPosition = targetCenter + velNorm * s;
+					}
+				}
+
+				return assumedPosition;
+			}
+
+			public static double GetRollAngleForUpperNorm(Vector3D orientationNormal, IMyTerminalBlock pivotBlock)
+			{
+				var symPlaneNormal = Vector3D.Normalize(Vector3D.Cross(pivotBlock.WorldMatrix.Forward, orientationNormal));
+				double y = Vector3D.Dot(symPlaneNormal, pivotBlock.WorldMatrix.Up);
+				return Math.Atan2(y, Vector3D.Dot(symPlaneNormal, pivotBlock.WorldMatrix.Left)) * 180 / Math.PI;
+			}
+
+			public static double GetPitchAngleForUpperNorm(Vector3D orientationNormal, IMyTerminalBlock pivotBlock)
+			{
+				var symPlaneNormal = Vector3D.Normalize(Vector3D.Cross(orientationNormal, pivotBlock.WorldMatrix.Left));
+				double y = Vector3D.Dot(symPlaneNormal, pivotBlock.WorldMatrix.Up);
+				return Math.Atan2(y, Vector3D.Dot(symPlaneNormal, pivotBlock.WorldMatrix.Forward)) * 180 / Math.PI;
+			}
+
+			public static Vector3D GetAnglesToPointTrig(Vector3D targetPosition, IMyTerminalBlock pivotBlock)
+			{
+				Vector3D targetNorm = Vector3D.Normalize(targetPosition - pivotBlock.GetPosition());
+				double yawCorrectionRads = Math.Acos(Vector3D.Dot(pivotBlock.WorldMatrix.Left, targetNorm));
+				double targetYawGrads = yawCorrectionRads * 180 / Math.PI - 90;
+				double targetPitchGrads = Math.Acos(Vector3D.Dot(pivotBlock.WorldMatrix.Up, targetNorm)) * 180 / Math.PI - 90;
+				return new Vector3D(targetYawGrads, -targetPitchGrads, 0);
+			}
+
+			public static Vector3D GetAnglesToPoint(Vector3D targetPosition, IMyTerminalBlock pivotBlock, MatrixD fwGyroDefault)
+			{
+				// only for turret!
+				var desM = MatrixD.CreateFromDir(Vector3D.Normalize(targetPosition - pivotBlock.WorldMatrix.Translation), pivotBlock.WorldMatrix.Up);
+				var myFrameRot = pivotBlock.WorldMatrix.GetOrientation();
+				var gatp = GetAnglesToPointMrot(desM, myFrameRot, fwGyroDefault);
+				return new Vector3D(-gatp.X, gatp.Y, gatp.Z);
+			}
+
+			public static Vector3D GetAnglesToPointMrot(MatrixD desiredRot, MatrixD myFrameRot, MatrixD fwGyroDefault)
+			{
+				var trans = desiredRot * MatrixD.Invert(myFrameRot);
+				Vector3D a;
+				MatrixD.GetEulerAnglesXYZ(ref trans, out a);
+				a = Vector3D.TransformNormal(a, fwGyroDefault * MatrixD.Invert(myFrameRot));
+				return a * 180 / Math.PI;
+			}
+
+			public static MatrixD GetTransMatrix(MatrixD pivot)
+			{
+				Vector3D pivotPosition = pivot.Translation;
+				MatrixD cameraBasedRotation = new MatrixD(
+					pivot.Left.GetDim(0), pivot.Left.GetDim(1), pivot.Left.GetDim(2), 0,
+					pivot.Up.GetDim(0), pivot.Up.GetDim(1), pivot.Up.GetDim(2), 0,
+					pivot.Forward.GetDim(0), pivot.Forward.GetDim(1), pivot.Forward.GetDim(2), 0,
+					0, 0, 0, 1);
+				cameraBasedRotation = MatrixD.Invert(cameraBasedRotation);
+				cameraBasedRotation = new MatrixD(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -pivotPosition.GetDim(0), -pivotPosition.GetDim(1), -pivotPosition.GetDim(2), 1) * cameraBasedRotation;
+				return cameraBasedRotation;
+			}
+
+			public static void SetOverride(IMyGyro gyro, Vector3 settings, int clock, float? fixedRoll = null)
+			{
+				float yaw = settings.Y;
+				float pitch = settings.X;
+				float roll = settings.Z;
+
+				float yawRads = (float)(yaw / 180 * Math.PI);
+				float pitchRads = (float)(pitch / 180 * Math.PI);
+				float rollRads = (float)(roll / 180 * Math.PI);
+
+				//int limitRPM = 2000;
+				int limitRPM = 60;
+
+				float adjustmentsPerSec = 60f / clock; // 12
+				double RPMtoRadsSec = 2 * Math.PI / 60f; // 0.1047
+				double radsClockAdjustedLimit = limitRPM * RPMtoRadsSec / adjustmentsPerSec; // 0.0436
+
+				float yawRadsSign = (yawRads > 0) ? 1f : -1f;
+				float pitchRadsSign = (pitchRads > 0) ? 1f : -1f;
+				float rollRadsSign = (rollRads > 0) ? 1f : -1f;
+
+				var radsPerTickMax = limitRPM * RPMtoRadsSec / clock; // 2PI/sec * 1 / clock = 0.52
+
+				float intertLagC = 5;
+				Func<double, double> rpmLimitSimple = x =>
+				{
+					var mag = Math.Abs(x); // rads
+					return mag > radsPerTickMax * intertLagC ? limitRPM : mag / (radsPerTickMax * intertLagC) * limitRPM;
+				};
+
+				var realRPMyaw = (float)rpmLimitSimple(yawRads) * yawRadsSign; // max at 0.4165 (per tick), 5 per sec
+				var realRPMpitch = (float)rpmLimitSimple(pitchRads) * pitchRadsSign;
+				var realRPMroll = (float)rpmLimitSimple(rollRads) * rollRadsSign;
+
+				if (fixedRoll.HasValue)
+					realRPMroll = fixedRoll.Value;
+				gyro.SetValue("Yaw", realRPMyaw);
+				gyro.SetValue("Pitch", realRPMpitch);
+				gyro.SetValue("Roll", realRPMroll);
+			}
+		}
+
+		MyDetectedEntityInfo lastScannedInfo;
+
+		AgentType MeType = AgentType.Unknown;
+		string ParentEntityID;
+		bool HaveRole(AgentType role)
+		{
+			return (MeType & role) == role;
+		}
+
+		void InitMeIdentity()
+		{
+			var parts = Me.CustomName.Split('[').Select(p => p.Trim(']'));
+			foreach (var p in parts)
+			{
+				if (p.Contains("clock"))
+				{
+					string[] pair = p.Split('=');
+					this.Clock = int.Parse(pair[1]);
+				}
+				if (p == "host")
+					MeType |= AgentType.Host;
+				if (p == "drone")
+					MeType |= AgentType.Drone;
+				if (p == "missile")
+					MeType |= AgentType.Missile;
+			}
+
+			this.ParentEntityID = Me.EntityId.ToString();
+		}
+
+		public enum AgentType
+		{
+			Unknown = 1,
+			Host = 2,
+			Drone = 4,
+			Missile = 8
+		}
+
+		public class IncomingMessage
+		{
+			public string Msg { get; set; }
+			public string From { get; set; }
+		}
+		IEnumerable<IncomingMessage> ParseMessage(string msg)
+		{
+			var items = msg.Split(new[] { "],[" }, StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim('[', ']')).ToList();
+			foreach (var item in items)
+			{
+				//string msg = "{recipient-types:Drone+Missile, recipient-ids: 12313+10, sender-id:H }command:handshake";
+				if (item.StartsWith("{"))
+				{
+					string[] parts = item.Split('}');
+					string body = parts[1];
+					string headers = parts[0].TrimStart('{');
+					string from = "";
+
+					bool itsForMe = true;
+					foreach (var pair in headers.Split(','))
+					{
+						var keyVal = pair.Split(':');
+						if (keyVal[0].Trim() == "recipient-types")
+						{
+							itsForMe = false;
+							foreach (string recipient in keyVal[1].Split('+'))
+							{
+								AgentType t;
+								Enum.TryParse(recipient.Trim(), out t);
+								if (HaveRole(t))
+									itsForMe = true;
+							}
+						}
+						if (keyVal[0].Trim() == "recipient-ids")
+						{
+							itsForMe = false;
+							foreach (string recipient in keyVal[1].Split('+'))
+							{
+								if (recipient.Trim() == this.ParentEntityID)
+									itsForMe = true;
+							}
+						}
+						if (keyVal[0].Trim() == "sender-id")
+						{
+							from = keyVal[1].Trim();
+						}
+					}
+
+					if (itsForMe)
+					{
+						yield return new IncomingMessage { Msg = body, From = from };
+					}
+					else
+					{
+						yield return new IncomingMessage();
+					}
+				}
+				else
+				{
+					yield return new IncomingMessage { Msg = item };
+				}
+			}
+		}
+		string WrapMessageFor(AgentType? types = null, params string[] ids)
+		{
+			// {recipient-types:Drone+Missile, recipient-ids: 12313+10, sender-id:H }command:handshake"
+			StringBuilder sb = new StringBuilder();
+			sb.Append('{');
+			List<string> headerPairs = new List<string>();
+
+			List<string> roles = new List<string>();
+			var values = Enum.GetValues(typeof(AgentType)).Cast<AgentType>();
+			if (types.HasValue)
+			{
+				foreach (var agentType in values)
+				{
+					if ((types & agentType) == agentType)
+						roles.Add(agentType.ToString());
+				}
+			}
+			if (roles.Count > 0)
+				headerPairs.Add("recipient-types:" + string.Join("+", roles));
+			if (ids.Length > 0)
+				headerPairs.Add("recipient-ids:" + string.Join("+", ids));
+
+			headerPairs.Add("sender-id:" + this.ParentEntityID);
+			return "{" + string.Join(", ", headerPairs) + "}";
+		}
+
+		// dock dispatcher test
+
+		//////////////////////////
+
+		List<IMyProgrammableBlock> subscribers;
+		void Delegate(TargetTelemetry t)
+		{
+			if (subscribers.Count == 0)
+				return;
+
+			//var msg = string.Format("command:set-vectors:{0}", VectorOpsHelper.V3DtoBroadcastString(t.Position.Value, t.Velocity.Value));
+			var basePosition = t.Position.Value;
+			//var msg = string.Format("command:set-vectors-trd:{0}", VectorOpsHelper.V3DtoBroadcastString(t.Position.Value, t.Velocity.Value));
+			var msg = VectorOpsHelper.V3DtoBroadcastString(t.Velocity.Value);
+
+			MyDetectedEntityInfo? info = null;
+			string vectorKey = null;
+			string extendedData = "";
+			if (t == CurrentTargetVectors)
+			{
+				info = ScanLock?.Info;
+				vectorKey = "set-vectors";
+			}
+			else if (t == TurretTargetVectors)
+			{
+				info = tdm.GetTarget();
+				vectorKey = "set-vectors-turret-intercept";
+			}
+			if ((info != null) && (!info.Value.IsEmpty()))
+			{
+				extendedData = VectorOpsHelper.MtrDtoBroadcastString(info.Value.Orientation);
+				extendedData += ":" + VectorOpsHelper.V3DtoBroadcastString(info.Value.BoundingBox.Min, info.Value.BoundingBox.Max);
+				if ((t == CurrentTargetVectors) && (ScanLock.FirstScanHitPositionLocal.HasValue))
+				{
+					var relHp = Vector3D.TransformNormal(ScanLock.FirstScanHitPositionLocal.Value, ScanLock.Info.Value.Orientation) + ScanLock.Info.Value.Position;
+					basePosition = relHp;
+					if (Toggle.Check("debug-raycast"))
+						E.R(relHp);
+				}
+				extendedData += ":" + info.Value.Type.ToString();
+			}
+
+			if (!string.IsNullOrEmpty(vectorKey))
+			{
+				msg = string.Format("command:{0}:{1}:{2}:{3}", vectorKey, VectorOpsHelper.V3DtoBroadcastString(basePosition), VectorOpsHelper.V3DtoBroadcastString(t.Velocity.Value), extendedData);
+				queuedCmds.Add(msg);
+				//carrierRemCon.CustomData = tickCount + "=>" + msg;
+			}
+		}
+
+		void Invalidate(TargetTelemetry t)
+		{
+			if (subscribers.Count == 0)
+				return;
+			if (t == CurrentTargetVectors)
+			{
+				queuedCmds.Add("command:set-vectors:invalidate");
+				//carrierRemCon.CustomData = tickCount + "=>command:set-vectors:invalidate";
+			}
+			else if (t == TurretTargetVectors)
+			{
+				queuedCmds.Add("command:set-vectors-turret-intercept:invalidate");
+				//carrierRemCon.CustomData = tickCount + "=>command:set-vectors-turret-intercept:invalidate";
+			}
+		}
+
+		List<string> queuedCmds = new List<string>(4);
+		public void NotifySubscribers()
+		{
+			if (queuedCmds.Count > 0)
+			{
+				var arg = string.Join(",", queuedCmds.Select(s => "[" + s + "]"));
+				foreach (var pb in subscribers)
+				{
+					if (pb != null)
+					{
+						if (pb.TryRun(arg))
+							metrics.PushedNotifications++;
+					}
+				}
+				queuedCmds.Clear();
+			}
+		}
+
+		////
+		/// 
+		/// feedback msg stuff
+
+		public enum MessageCategories { Log = 0, Dynamics, ScanData, Driver, Lock }
+
+		List<IMyTextPanel> panels = new List<IMyTextPanel>();
+		IFeedbackWriter logger;
+		StringBuilder sb = new StringBuilder(2048);
+		public void SendFeedback(string message, MessageCategories category)
+		{
+			if (category == MessageCategories.Log)
+			{
+				if (logger != null)
+				{
+					logger.WritePublicText(DateTime.Now.ToString("hh:mm:ss ") + message);
+				}
+			}
+			else
+			{
+				if (panels.Count > 0)
+					sb.AppendLine(message);
+			}
+		}
+		public void FlushFeedbackBuffer()
+		{
+			if (sb.Length > 0)
+			{
+				foreach(var panel in panels)
+				{
+					panel.WriteText(sb.ToString());
+				}
+				sb.Clear();
+			}
+		}
+
+		public void SendFeedback(StringBuilder sb, MessageCategories category)
+		{
+			SendFeedback(sb.ToString(), category);
+		}
+
+		public interface IFeedbackWriter
+		{
+			void WritePublicText(string message);
+			void AddPanel(IMyTextPanel panel);
+			void ClearAllText();
+		}
+
+		public class RollingAppender : IFeedbackWriter
+		{
+			List<IMyTextPanel> panels = new List<IMyTextPanel>();
+			int maxLinesCount;
+			int? maxCharsPerLine;
+			public RollingAppender(int maxLinesCount, int? maxCharsPerLine = null, Action<List<IMyTextPanel>> configurator = null)
+			{
+				this.maxLinesCount = maxLinesCount;
+				this.maxCharsPerLine = maxCharsPerLine;
+				configurator?.Invoke(this.panels);
+			}
+			public void AddPanel(IMyTextPanel panel)
+			{
+				if ((panel != null) && !panels.Contains(panel))
+					panels.Add(panel);
+			}
+			void Push(string message)
+			{
+				foreach (IMyTextPanel outputPanel in panels)
+				{
+					var str = outputPanel.GetText().TrimEnd('\n');
+					string[] currentlySavedLines = str.Split('\n');
+					int availableLinesCount = this.maxLinesCount - currentlySavedLines.Length;
+					string[] messageLines = message.TrimEnd('\n').Split('\n');
+
+					List<string> csLines = currentlySavedLines.ToList();
+					List<string> linesTW = messageLines.ToList();
+					csLines.AddRange(linesTW);
+					availableLinesCount -= messageLines.Length;
+					StringBuilder sb = new StringBuilder();
+					for (int n = 0; n < csLines.Count; n++)
+					{
+						if (availableLinesCount < 0)
+						{
+							availableLinesCount++;
+							continue;
+						}
+						sb.Append(csLines[n] + "\n");
+					}
+					outputPanel.WriteText(sb.ToString());
+				}
+			}
+
+			public void WritePublicText(string message)
+			{
+				if (this.maxCharsPerLine.HasValue)
+				{
+					message = string.Join("\n", Wrap(message.Trim('\n'), this.maxCharsPerLine.Value));
+				}
+				this.Push(message);
+			}
+
+			public void ClearAllText()
+			{
+				foreach (IMyTextPanel outputPanel in panels)
+				{
+					outputPanel.WriteText(string.Empty);
+				}
+			}
+		}
+
+		// string wrapping by Bryan Reynolds
+		public static List<String> Wrap(string text, int maxLength)
+		{
+			if (text.Length == 0) return new List<string>();
+			var words = text.Split(' ');
+			var lines = new List<string>();
+			var currentLine = "";
+			foreach (var currentWord in words)
+			{
+				if ((currentLine.Length > maxLength) || ((currentLine.Length + currentWord.Length) > maxLength))
+				{
+					lines.Add(currentLine);
+					currentLine = "";
+				}
+				if (currentLine.Length > 0)
+					currentLine += " " + currentWord;
+				else
+					currentLine += currentWord;
+			}
+			if (currentLine.Length > 0)
+				lines.Add(currentLine);
+			return lines;
+		}
+
+		public static class E
+		{
+			static string debugTag = "";
+			static Action<string> e;
+			static IMyTextPanel p;
+			public static void Init(Action<string> echo, IMyGridTerminalSystem g)
+			{
+				e = echo;
+				p = g.GetBlockWithName("LCD Debug") as IMyTextPanel;
+			}
+			public static void Echo(string s) { if ((debugTag == "") || (s.Contains(debugTag))) e(s); }
+
+			static string buff = "";
+			public static void DebugToPanel(string s)
+			{
+				if (p != null)
+					buff += s + "\n";
+			}
+
+			public static void MatToPanel(MatrixD m)
+			{
+				DebugToPanel(m.Col0.ToString("F1"));
+				DebugToPanel(m.Col1.ToString("F1"));
+				DebugToPanel(m.Col2.ToString("F1"));
+				DebugToPanel(m.Translation.ToString("F1"));
+			}
+
+			public static void FlushDebugPanel()
+			{
+				if (!string.IsNullOrEmpty(buff))
+				{
+					p.WriteText(buff);
+					buff = "";
+				}
+			}
+
+			static IMyCameraBlock debCam;
+			public static void I(IMyCameraBlock c) { debCam = c; }
+			public static void R(Vector3D v)
+			{
+				if (debCam != null)
+					debCam.Raycast(v);
+			}
+		}

@@ -1,0 +1,960 @@
+
+//
+
+/*
+ * R e a d m e
+ * -----------
+ * 
+ * Original: https://steamcommunity.com/sharedfiles/filedetails/?id=2476194877
+ * Thanks to rytalin for making CustomData functional!
+ * 
+ * Setup instruction tl;dr: Missile must have at minimum 1 power/1 merge/1 gyro/1 thruster, name missile parts #A#, run Fire on PB
+ * 
+ */
+
+
+
+
+
+double LaunchDist = 100;
+
+string MissileTag = "#A#";
+
+bool AutoLaunch = false;
+int Milliseconds_Between_Launch = 180;
+
+double TOW_Distance = 50000;
+bool OverrideToLongTargets = false;
+
+
+
+string VERSION = "1.05";
+
+
+class MISSILE
+{
+    public IMyTerminalBlock GYRO;
+    public IMyTerminalBlock TURRET;
+    public IMyTerminalBlock MERGE;
+    public List<IMyThrust> THRUSTERS = new List<IMyThrust>();
+    public IMyTerminalBlock POWER;
+    public List<IMyTerminalBlock> WARHEADS = new List<IMyTerminalBlock>();
+
+    public double MissileAccel = 10;
+    public double MissileMass = 0;
+    public double MissileThrust = 0;
+    public bool IsLargeGrid = false;
+    public double FuseDistance = 7;
+
+    public bool HAS_DETACHED = false;
+    public bool IS_CLEAR = false;
+    public Vector3D TARGET_PREV_POS = new Vector3D();
+    public Vector3D MIS_PREV_POS = new Vector3D();
+
+    public double PREV_Yaw = 0;
+    public double PREV_Pitch = 0;
+
+}
+List<MISSILE> MISSILES = new List<MISSILE>();
+
+
+bool customdatatoconfig(IMyProgrammableBlock me, string input, ref string output, string search)
+{
+    System.Text.RegularExpressions.MatchCollection matchcollection = System.Text.RegularExpressions.Regex.Matches(input, search + @"\s?=\s?(.+?);");
+    foreach (System.Text.RegularExpressions.Match match in matchcollection)
+    {
+        if (match.Groups.Count == 2)
+        {
+            output = (match.Groups[1].Value.Trim());
+            return true;
+        }
+        else
+            return false;
+    }
+    return false;
+}
+
+void overridecustomdata(IMyProgrammableBlock me)
+{
+    me.CustomData =
+    (
+        @"
+                LaunchDist = 15;
+                MissileTag = #A#;
+                AutoLaunch = false;
+                Milliseconds_Between_Launch = 180;
+                TOW_Distance = 3000;
+                OverrideToLongTargets = false;
+                "
+     );
+}
+
+
+
+double Global_Timestep = 0.016;
+double PNGain = 3;
+double ThisShipSize = 10;
+string Lstrundata = "Please ensure you have read the \n setup and hints & tips, found within \n the custom data of this block\n";
+IEnumerator<bool> LaunchStateMachine;
+IMyLargeTurretBase Turret;
+IMySoundBlock Alarm;
+IMyShipController RC;
+IMyCameraBlock TOWCamera;
+MyDetectedEntityInfo TemporaryTarget;
+int AutoLaunchTimer = 0;
+WcPbApi wcPbApi;
+bool HasTarget = false;
+
+Program()
+{
+    Runtime.UpdateFrequency = Global_Timestep == 0.16 ? UpdateFrequency.Update10 : UpdateFrequency.Update1;
+
+
+
+    if (!Me.CustomData.Contains("LaunchDist") || !Me.CustomData.Contains("MissileTag") || !Me.CustomData.Contains("AutoLaunch") || !Me.CustomData.Contains("Milliseconds_Between_Launch") || !Me.CustomData.Contains("TOW_Distance") || !Me.CustomData.Contains("OverrideToLongTargets"))
+    {
+        overridecustomdata(Me);
+    }
+
+    bool successful = true;
+    string result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "LaunchDist"))
+    {
+        successful = double.TryParse(result, out LaunchDist);
+    }
+    result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "MissileTag"))
+    {
+        MissileTag = result;
+    }
+    result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "AutoLaunch"))
+    {
+        successful = bool.TryParse(result, out AutoLaunch);
+    }
+    result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "Milliseconds_Between_Launch"))
+    {
+        successful = int.TryParse(result, out Milliseconds_Between_Launch);
+    }
+    result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "TOW_Distance"))
+    {
+        successful = double.TryParse(result, out TOW_Distance);
+    }
+    result = "";
+    if (customdatatoconfig(Me, Me.CustomData, ref result, "OverrideToLongTargets"))
+    {
+        successful = bool.TryParse(result, out OverrideToLongTargets);
+    }
+    if (!successful) { overridecustomdata(Me); }
+
+
+
+
+    ThisShipSize = (Me.CubeGrid.WorldVolume.Radius);
+    ThisShipSize = LaunchDist == 0 ? ThisShipSize : LaunchDist;
+
+    List<IMyTerminalBlock> TempCollection = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyLargeTurretBase>(TempCollection, a => a.CustomName.Contains(MissileTag) && a.DetailedInfo != "NoUse");
+    if (TempCollection.Count > 0)
+    { Turret = TempCollection[0] as IMyLargeTurretBase; }
+
+    List<IMyTerminalBlock> TempCollection2 = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMySoundBlock>(TempCollection2, a => a.DetailedInfo != "NoUse");
+    if (TempCollection2.Count > 0)
+    {
+        Alarm = TempCollection2[0] as IMySoundBlock;
+        Alarm.SelectedSound = "SoundBlockAlert2";
+        Alarm.LoopPeriod = 99999;
+        Alarm.Play();
+        Alarm.Enabled = false;
+    }
+
+    List<IMyTerminalBlock> TempCollection3 = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipController>(TempCollection3, a => a.DetailedInfo != "NoUse");
+    if (TempCollection3.Count > 0)
+    { RC = TempCollection3[0] as IMyShipController; }
+
+    List<IMyTerminalBlock> TempCollection4 = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyCameraBlock>(TempCollection3, a => a.DetailedInfo == "#A#");
+    if (TempCollection3.Count > 0)
+    { TOWCamera = TempCollection3[0] as IMyCameraBlock; TOWCamera.EnableRaycast = true; }
+
+    wcPbApi = new WcPbApi();
+    wcPbApi.Activate(Me);
+
+}
+
+void Main(string argument)
+{
+    if (AutoLaunch)
+        HasTarget = GetTarget();
+    OP_BAR();
+    QuickEcho(MISSILES.Count, "Active (Fired) Missiles:");
+    QuickEcho(Runtime.LastRunTimeMs, "Runtime:");
+    Echo("Version:  " + VERSION);
+    Echo("AutoLaunch:  " + AutoLaunch);
+    Echo("\nInfo:\n---------------");
+    Echo(Lstrundata);
+
+
+    if (RC == null || RC.CubeGrid.GetCubeBlock(RC.Position) == null)
+    { Echo(" ~ No Ship Control Found,\nInstall Forward Facing Cockpit/RC/Flightseat And Press Recompile"); RC = null; return; }
+    if (Turret == null || Turret.CubeGrid.GetCubeBlock(Turret.Position) == null)
+    { Echo(" ~ Searching For A new Seeker\n (Guidance Turret)\n Name Of Turret Needs to be: '#A#'\nInstall Block And Press Recompile"); Turret = null; return; }
+    if (Alarm == null || Alarm.CubeGrid.GetCubeBlock(Alarm.Position) == null)
+    { Echo(" ~ No Sound Block For Lock Tone Found,\nInstall Block And Press Recompile\n (script will work fine without) "); Alarm = null; }
+
+
+    if (Turret != null)
+    {
+        if (Alarm != null)
+        {
+            if (HasTarget && !Alarm.Enabled)
+            { Alarm.Enabled = true; }
+            else if (HasTarget && Alarm.Enabled)
+            { Alarm.Enabled = false; }
+        }
+
+        if (HasTarget)
+        { AutoLaunchTimer = (AutoLaunchTimer + 1) % (Milliseconds_Between_Launch); }
+        if (AutoLaunchTimer == Milliseconds_Between_Launch * 0.8 && AutoLaunch)
+        { argument = "Fire"; }
+    }
+
+    if (argument == "Fire" && LaunchStateMachine == null)
+    {
+        LaunchStateMachine = MissileLaunchHandler().GetEnumerator();
+    }
+    if (argument != "Fire" && argument != "")
+    {
+        Lstrundata = "Unknown/Incorrect launch argument,\ncheck spelling & caps,\nto launch argument should be just: Fire\n ";
+    }
+
+    for (int i = 0; i < MISSILES.Count; i++)
+    {
+        var ThisMissile = MISSILES[i];
+
+        if (ThisMissile.IS_CLEAR == true)
+        { STD_GUIDANCE(ThisMissile); }
+
+        else if (ThisMissile.IS_CLEAR == false)
+        {
+            if ((ThisMissile.GYRO.GetPosition() - Me.GetPosition()).Length() > ThisShipSize)
+            { ThisMissile.IS_CLEAR = true; }
+        }
+
+        bool Isgyroout = ThisMissile.GYRO.CubeGrid.GetCubeBlock(ThisMissile.GYRO.Position) == null;
+        bool Isthrusterout = ThisMissile.THRUSTERS[0].CubeGrid.GetCubeBlock(ThisMissile.THRUSTERS[0].Position) == null;
+        bool Isouttarange = (ThisMissile.GYRO.GetPosition() - Me.GetPosition()).LengthSquared() > 9000 * 9000;
+        if (Isgyroout || Isthrusterout || Isouttarange)
+        { MISSILES.Remove(ThisMissile); }
+
+    }
+
+    if (LaunchStateMachine != null)
+    {
+        if (!LaunchStateMachine.MoveNext() || !LaunchStateMachine.Current)
+        {
+            LaunchStateMachine.Dispose();
+            LaunchStateMachine = null;
+        }
+    }
+}
+
+
+
+private bool GetTarget()
+{
+    Dictionary<MyDetectedEntityInfo, float> targetList = new Dictionary<MyDetectedEntityInfo, float>();
+    wcPbApi.GetSortedThreats(Me, targetList);
+    if (targetList.Count > 0)
+    {
+        var target = targetList.FirstOrDefault().Key;
+        return true;
+    }
+
+    return false;
+}
+
+public IEnumerable<bool> MissileLaunchHandler()
+{
+
+    yield return INIT_NEXT_MISSILE();
+
+    MISSILE ThisMissile = MISSILES[MISSILES.Count - 1];
+    var MERGE_A = ThisMissile.MERGE;
+    (MERGE_A as IMyShipMergeBlock).Enabled = false;
+    yield return true;
+    yield return true;
+    yield return true;
+    yield return true;
+    yield return true;
+
+    PREP_FOR_LAUNCH(MISSILES.Count - 1);
+
+}
+
+void STD_GUIDANCE(MISSILE This_Missile)
+{
+
+    Vector3D ENEMY_POS = EnemyScan(This_Missile);
+
+
+    Vector3D MissilePosition = This_Missile.GYRO.CubeGrid.WorldVolume.Center;
+    Vector3D MissilePositionPrev = This_Missile.MIS_PREV_POS;
+    Vector3D MissileVelocity = (MissilePosition - MissilePositionPrev) / Global_Timestep;
+
+    Vector3D TargetPosition = ENEMY_POS;
+    Vector3D TargetPositionPrev = This_Missile.TARGET_PREV_POS;
+    Vector3D TargetVelocity = (TargetPosition - This_Missile.TARGET_PREV_POS) / Global_Timestep;
+
+
+    Vector3D LOS_Old = Vector3D.Normalize(TargetPositionPrev - MissilePositionPrev);
+    Vector3D LOS_New = Vector3D.Normalize(TargetPosition - MissilePosition);
+    Vector3D Rel_Vel = Vector3D.Normalize(TargetVelocity - MissileVelocity);
+
+    Vector3D am = new Vector3D(1, 0, 0); double LOS_Rate; Vector3D LOS_Delta;
+    Vector3D MissileForwards = This_Missile.THRUSTERS[0].WorldMatrix.Backward;
+
+    if (LOS_Old.Length() == 0)
+    { LOS_Delta = new Vector3D(0, 0, 0); LOS_Rate = 0.0; }
+    else
+    { LOS_Delta = LOS_New - LOS_Old; LOS_Rate = LOS_Delta.Length() / Global_Timestep; }
+
+
+    double Vclosing = (TargetVelocity - MissileVelocity).Length();
+
+    Vector3D GravityComp = -RC.GetNaturalGravity();
+
+    Vector3D LateralDirection = Vector3D.Normalize(Vector3D.Cross(Vector3D.Cross(Rel_Vel, LOS_New), Rel_Vel));
+    Vector3D LateralAccelerationComponent = LateralDirection * PNGain * LOS_Rate * Vclosing + LOS_Delta * 9.8 * (0.5 * PNGain);
+
+    double OversteerReqt = (LateralAccelerationComponent).Length() / This_Missile.MissileAccel;
+    if (OversteerReqt > 0.98)
+    {
+        LateralAccelerationComponent = This_Missile.MissileAccel * Vector3D.Normalize(LateralAccelerationComponent + (OversteerReqt * Vector3D.Normalize(-MissileVelocity)) * 40);
+    }
+
+    double ThrustPower = RdavUtils.Vector_Projection_Scalar(MissileForwards, Vector3D.Normalize(LateralAccelerationComponent));
+    ThrustPower = This_Missile.IsLargeGrid ? MathHelper.Clamp(ThrustPower, 0.9, 1) : ThrustPower;
+
+    ThrustPower = MathHelper.Clamp(ThrustPower, 0.4, 1);
+    foreach (IMyThrust thruster in This_Missile.THRUSTERS)
+    {
+        if (thruster.ThrustOverride != (thruster.MaxThrust * ThrustPower))
+        { thruster.ThrustOverride = (float)(thruster.MaxThrust * ThrustPower); }
+    }
+
+    double RejectedAccel = Math.Sqrt(This_Missile.MissileAccel * This_Missile.MissileAccel - LateralAccelerationComponent.LengthSquared());
+    if (double.IsNaN(RejectedAccel)) { RejectedAccel = 0; }
+    LateralAccelerationComponent = LateralAccelerationComponent + LOS_New * RejectedAccel;
+
+
+    am = Vector3D.Normalize(LateralAccelerationComponent + GravityComp);
+    double Yaw; double Pitch;
+    GyroTurn6(am, 18, 0.3, This_Missile.THRUSTERS[0], This_Missile.GYRO as IMyGyro, This_Missile.PREV_Yaw, This_Missile.PREV_Pitch, out Pitch, out Yaw);
+
+    This_Missile.TARGET_PREV_POS = TargetPosition;
+    This_Missile.MIS_PREV_POS = MissilePosition;
+    This_Missile.PREV_Yaw = Yaw;
+    This_Missile.PREV_Pitch = Pitch;
+
+    if ((TargetPosition - MissilePosition).LengthSquared() < 20 * 20 && This_Missile.WARHEADS.Count > 0)
+    { foreach (var item in This_Missile.WARHEADS) { (item as IMyWarhead).IsArmed = true; } }
+    if ((TargetPosition - MissilePosition).LengthSquared() < This_Missile.FuseDistance * This_Missile.FuseDistance && This_Missile.WARHEADS.Count > 0)
+    { (This_Missile.WARHEADS[0] as IMyWarhead).Detonate(); }
+
+}
+
+Vector3D EnemyScan(MISSILE This_Missile)
+{
+    if (wcPbApi == null)
+    {
+        wcPbApi = new WcPbApi();
+        wcPbApi.Activate(Me);
+    }
+
+    if (AutoLaunch)
+    {
+        Dictionary<MyDetectedEntityInfo, float> targetList = new Dictionary<MyDetectedEntityInfo, float>();
+        wcPbApi.GetSortedThreats(Me, targetList);
+        if (targetList.Count > 0)
+        {
+            var target = targetList.FirstOrDefault().Key;
+            HasTarget = true;
+            return (Vector3D)target.Position;
+        }
+        HasTarget = false;
+        return Vector3D.Zero;
+    }
+    else
+    {
+        var target = wcPbApi.GetAiFocus(Me.EntityId);
+        if (target != null)
+        {
+            HasTarget = true;
+            return (Vector3D)target.Value.Position;
+        }
+        HasTarget = false;
+        return Vector3D.Zero;
+    }
+
+}
+
+bool INIT_NEXT_MISSILE()
+{
+
+    List<IMyTerminalBlock> GYROS = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyGyro>(GYROS, b => b.CustomName.Contains(MissileTag));
+    List<IMyTerminalBlock> TURRETS = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyLargeTurretBase>(TURRETS, b => b.CustomName.Contains(MissileTag));
+    List<IMyThrust> THRUSTERS = new List<IMyThrust>();
+    GridTerminalSystem.GetBlocksOfType<IMyThrust>(THRUSTERS, b => b.CustomName.Contains(MissileTag));
+    List<IMyTerminalBlock> MERGES = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyShipMergeBlock>(MERGES, b => b.CustomName.Contains(MissileTag));
+    List<IMyTerminalBlock> BATTERIES = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyTerminalBlock>(BATTERIES, b => b.CustomName.Contains(MissileTag) && (b is IMyBatteryBlock || b is IMyReactor));
+    List<IMyTerminalBlock> WARHEADS = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyWarhead>(WARHEADS, b => b.CustomName.Contains(MissileTag));
+
+    Lstrundata = "No More Missile (Gyros) Detected";
+
+    foreach (var Key_Gyro in GYROS)
+    {
+        MISSILE NEW_MISSILE = new MISSILE();
+        NEW_MISSILE.GYRO = Key_Gyro;
+
+        Vector3D GyroPos = Key_Gyro.GetPosition();
+        double Distance = 40;
+
+        List<IMyTerminalBlock> TempTurrets = TURRETS.FindAll(b => (b.GetPosition() - GyroPos).LengthSquared() < 100000);
+        TempTurrets.Sort((x, y) => (x.GetPosition() - Key_Gyro.GetPosition()).LengthSquared().CompareTo((y.GetPosition() - Key_Gyro.GetPosition()).LengthSquared()));
+
+        List<IMyTerminalBlock> TempPower = BATTERIES.FindAll(b => (b.GetPosition() - GyroPos).LengthSquared() < Distance * Distance);
+        TempPower.Sort((x, y) => (x.GetPosition() - Key_Gyro.GetPosition()).LengthSquared().CompareTo((y.GetPosition() - Key_Gyro.GetPosition()).LengthSquared()));
+
+        List<IMyTerminalBlock> TempMerges = MERGES.FindAll(b => (b.GetPosition() - GyroPos).LengthSquared() < Distance * Distance);
+        TempMerges.Sort((x, y) => (x.GetPosition() - Key_Gyro.GetPosition()).LengthSquared().CompareTo((y.GetPosition() - Key_Gyro.GetPosition()).LengthSquared()));
+
+        NEW_MISSILE.THRUSTERS = THRUSTERS.FindAll(b => (b.GetPosition() - GyroPos).LengthSquared() < Distance * Distance);
+
+        NEW_MISSILE.WARHEADS = WARHEADS.FindAll(b => (b.GetPosition() - GyroPos).LengthSquared() < Distance * Distance);
+
+        bool HasTurret = TempTurrets.Count > 0;
+        bool HasPower = TempPower.Count > 0;
+        bool HasMerge = TempMerges.Count > 0;
+        bool HasThruster = NEW_MISSILE.THRUSTERS.Count > 0;
+
+        Lstrundata = "Last Missile Failed To Fire\nReason:" +
+            "\nHas Gyro: True" +
+            "\nHas Turret: " + HasTurret +
+            "\nHas Power: " + HasPower +
+            "\nHasMerge: " + HasMerge +
+            "\nHasThruster: " + HasThruster;
+
+        if (HasTurret && HasPower && HasMerge && HasThruster)
+        {
+            NEW_MISSILE.TURRET = TempTurrets[0];
+            NEW_MISSILE.POWER = TempPower[0];
+            NEW_MISSILE.MERGE = TempMerges[0];
+            MISSILES.Add(NEW_MISSILE);
+            Lstrundata = "Launched Missile:" + MISSILES.Count;
+            return true;
+        }
+    }
+    return false;
+}
+
+void PREP_FOR_LAUNCH(int INT)
+{
+    Echo(INT + "");
+    MISSILE ThisMissile = MISSILES[INT];
+    ThisMissile.MissileMass = 0;
+    ThisMissile.MissileThrust = 0;
+
+    var POWER_A = ThisMissile.POWER;
+    if (ThisMissile.POWER != null && ThisMissile.POWER is IMyBatteryBlock)
+    {
+        POWER_A.ApplyAction("OnOff_On");
+        (POWER_A as IMyBatteryBlock).ChargeMode = ChargeMode.Discharge;
+        ThisMissile.MissileMass += POWER_A.Mass;
+    }
+
+    List<IMyThrust> TemporaryThrust = new List<IMyThrust>();
+    TemporaryThrust.AddRange(ThisMissile.THRUSTERS);
+    for (int i = 0; i < TemporaryThrust.Count; i++)
+    {
+        var item = TemporaryThrust[i];
+        if (item.CubeGrid != ThisMissile.GYRO.CubeGrid)
+        { ThisMissile.THRUSTERS.Remove(item); continue; }
+    }
+    if (ThisMissile.THRUSTERS.Count == 0)
+    {
+        Lstrundata = "Missile Failed To Fire\nReason: No Detectable Thrusters On Missile Or Missile Still Attached To Launcher";
+        MISSILES.Remove(ThisMissile);
+        return;
+    }
+
+    Dictionary<Vector3D, double> ThrustDict = new Dictionary<Vector3D, double>();
+    foreach (IMyThrust item in ThisMissile.THRUSTERS)
+    {
+        Vector3D Fwd = item.WorldMatrix.Forward;
+        double Thrval = item.MaxEffectiveThrust;
+
+        if (ThrustDict.ContainsKey(Fwd) == false)
+        { ThrustDict.Add(Fwd, Thrval); }
+        else
+        { ThrustDict[Fwd] = ThrustDict[Fwd] + Thrval; }
+    }
+    List<KeyValuePair<Vector3D, double>> ThrustList = ThrustDict.ToList();
+    ThrustList.Sort((x, y) => y.Value.CompareTo(x.Value));
+    Vector3D ThrForward = ThrustList[0].Key;
+
+    TemporaryThrust = new List<IMyThrust>();
+    TemporaryThrust.AddRange(ThisMissile.THRUSTERS);
+    for (int i = 0; i < TemporaryThrust.Count; i++)
+    {
+        var item = TemporaryThrust[i];
+
+        if (item.WorldMatrix.Forward != ThrForward)
+        { item.ApplyAction("OnOff_On"); ThisMissile.THRUSTERS.Remove(item); continue; }
+
+        item.ApplyAction("OnOff_On");
+        double ThisThrusterThrust = (item as IMyThrust).MaxThrust;
+        (item as IMyThrust).ThrustOverride = (float)ThisThrusterThrust;
+        RdavUtils.DiagTools.Diag_Plot(Me, ThisThrusterThrust);
+        ThisMissile.MissileThrust += ThisThrusterThrust;
+        ThisMissile.MissileMass += item.Mass;
+    }
+
+    List<IMyTerminalBlock> TemporaryWarheads = new List<IMyTerminalBlock>();
+    TemporaryWarheads.AddRange(ThisMissile.WARHEADS);
+    for (int i = 0; i < ThisMissile.WARHEADS.Count; i++)
+    {
+        var item = TemporaryWarheads[i];
+
+        if (item.CubeGrid != ThisMissile.GYRO.CubeGrid)
+        { ThisMissile.WARHEADS.Remove(item); continue; }
+
+        ThisMissile.MissileMass += item.Mass;
+    }
+
+
+    ThisMissile.MissileMass += ThisMissile.GYRO.Mass;
+    ThisMissile.MissileMass += ThisMissile.MERGE.Mass;
+    double number;
+    if (double.TryParse(ThisMissile.GYRO.CustomData, out number))
+    { double.TryParse(ThisMissile.GYRO.CustomData, out ThisMissile.MissileMass); }
+    ThisMissile.MissileAccel = ThisMissile.MissileThrust / ThisMissile.MissileMass;
+
+    ThisMissile.IsLargeGrid = ThisMissile.GYRO.CubeGrid.GridSizeEnum == MyCubeSize.Large;
+    ThisMissile.FuseDistance = ThisMissile.IsLargeGrid ? 16 : 7;
+
+}
+
+string LeftPad = "   ";
+string Scriptname = "Rdav Missile Guidance";
+string[] FUNCTION_BAR = new string[] { "", " ===||===", " ==|==|==", " =|====|=", " |======|", "  ======" };
+int FUNCTION_TIMER = 0;
+void OP_BAR()
+{
+    FUNCTION_TIMER++;
+    Echo(LeftPad + "~ " + Scriptname + " ~  \n               " + FUNCTION_BAR[FUNCTION_TIMER] + "");
+    if (FUNCTION_TIMER == 5) { FUNCTION_TIMER = 0; }
+}
+
+static class RdavUtils
+{
+
+    public static bool Quadractic_Solv(double a, double b, double c, out double X1, out double X2)
+    {
+        X1 = 0;
+        X2 = 0;
+
+        Double Discr = b * b - 4 * c;
+        if (Discr < 0)
+        { return false; }
+
+        else
+        {
+            X1 = (-b + Math.Sqrt(Discr)) / (2 * a);
+            X2 = (-b - Math.Sqrt(Discr)) / (2 * a);
+        }
+        return true;
+    }
+
+    public static double CalculateArea(double OuterDiam, double InnerDiam)
+    {
+        double PI = 3.14159;
+        double Output = ((OuterDiam * OuterDiam * PI) / 4) - ((InnerDiam * InnerDiam * PI) / 4);
+        return Output;
+    }
+
+    public static double Vector_Projection_Scalar(Vector3D IN, Vector3D Axis_norm)
+    {
+        double OUT = 0;
+        OUT = Vector3D.Dot(IN, Axis_norm);
+        if (OUT == double.NaN)
+        { OUT = 0; }
+        return OUT;
+    }
+
+    public static Vector3D Vector_Projection_Vector(Vector3D IN, Vector3D Axis_norm)
+    {
+        Vector3D OUT = new Vector3D();
+        OUT = Vector3D.Dot(IN, Axis_norm) * Axis_norm;
+        if (OUT + "" == "NaN")
+        { OUT = new Vector3D(); ; }
+        return OUT;
+    }
+
+    public static bool SphereIntersect_Solv(BoundingSphereD Sphere, Vector3D LineStart, Vector3D LineDirection, out Vector3D Point1, out Vector3D Point2)
+    {
+        Point1 = new Vector3D();
+        Point2 = new Vector3D();
+
+        Vector3D O = LineStart;
+        Vector3D D = LineDirection;
+        Double R = Sphere.Radius;
+        Vector3D C = Sphere.Center;
+
+        Double b = 2 * (Vector3D.Dot(O - C, D));
+        Double c = Vector3D.Dot((O - C), (O - C)) - R * R;
+
+        Double t1, t2;
+        if (!Quadractic_Solv(1, b, c, out t1, out t2))
+        { return false; }
+        else
+        {
+            Point1 = LineStart + LineDirection * t1;
+            Point2 = LineStart + LineDirection * t2;
+            return true;
+        }
+    }
+
+    public static Vector3D GetPredictedTargetPosition2(IMyTerminalBlock shooter, Vector3 ShipVel, MyDetectedEntityInfo target, float shotSpeed)
+    {
+        Vector3D predictedPosition = target.Position;
+        Vector3D dirToTarget = Vector3D.Normalize(predictedPosition - shooter.GetPosition());
+
+        Vector3 targetVelocity = target.Velocity;
+        targetVelocity -= ShipVel;
+        Vector3 targetVelOrth = Vector3.Dot(targetVelocity, dirToTarget) * dirToTarget;
+        Vector3 targetVelTang = targetVelocity - targetVelOrth;
+        Vector3 shotVelTang = targetVelTang;
+        float shotVelSpeed = shotVelTang.Length();
+
+        if (shotVelSpeed > shotSpeed)
+        {
+            return Vector3.Normalize(target.Velocity) * shotSpeed;
+        }
+        else
+        {
+            float shotSpeedOrth = (float)Math.Sqrt(shotSpeed * shotSpeed - shotVelSpeed * shotVelSpeed);
+            Vector3 shotVelOrth = dirToTarget * shotSpeedOrth;
+            float timeDiff = shotVelOrth.Length() - targetVelOrth.Length();
+            var timeToCollision = timeDiff != 0 ? ((shooter.GetPosition() - target.Position).Length()) / timeDiff : 0;
+            Vector3 shotVel = shotVelOrth + shotVelTang;
+            predictedPosition = timeToCollision > 0.01f ? shooter.GetPosition() + (Vector3D)shotVel * timeToCollision : predictedPosition;
+            return predictedPosition;
+        }
+    }
+
+    public static class DiagTools
+    {
+        public static void Diag_Plot(IMyTerminalBlock Block, object Data1)
+        {
+            Block.CustomData = Block.CustomData + Data1 + "\n";
+        }
+
+        public static void Renam_Block_Typ(IMyGridTerminalSystem GTS, string RenameTo)
+        {
+            List<IMyTerminalBlock> TempCollection = new List<IMyTerminalBlock>();
+            GTS.GetBlocksOfType<IMyRadioAntenna>(TempCollection);
+            if (TempCollection.Count < 1)
+            { return; }
+            TempCollection[0].CustomName = RenameTo;
+        }
+
+        public static void Renam_Block_Cust(IMyGridTerminalSystem GTS, string customnam, string RenameTo)
+        {
+            List<IMyTerminalBlock> TempCollection = new List<IMyTerminalBlock>();
+            GTS.GetBlocksOfType<IMyTerminalBlock>(TempCollection, a => a.CustomData == customnam);
+            if (TempCollection.Count < 1)
+            { return; }
+            else
+            { TempCollection[0].CustomName = RenameTo; }
+        }
+
+    }
+}
+
+void QuickEcho(object This, string Title = "")
+{
+    if (This is Vector3D)
+    { Echo(Title + " " + Vector3D.Round(((Vector3D)This), 3)); }
+    else if (This is double)
+    { Echo(Title + " " + Math.Round(((double)This), 3)); }
+    else
+    { Echo(Title + " " + This); }
+}
+
+void GotHere(int number)
+{
+    Echo("GotHere " + number);
+}
+
+
+void GyroTurn6(Vector3D TARGETVECTOR, double GAIN, double DAMPINGGAIN, IMyTerminalBlock REF, IMyGyro GYRO, double YawPrev, double PitchPrev, out double NewPitch, out double NewYaw)
+{
+    NewYaw = 0;
+    NewPitch = 0;
+
+    Vector3D ShipUp = REF.WorldMatrix.Up;
+    Vector3D ShipForward = REF.WorldMatrix.Backward;
+
+    Quaternion Quat_Two = Quaternion.CreateFromForwardUp(ShipForward, ShipUp);
+    var InvQuat = Quaternion.Inverse(Quat_Two);
+
+    Vector3D DirectionVector = TARGETVECTOR;
+    Vector3D RCReferenceFrameVector = Vector3D.Transform(DirectionVector, InvQuat);
+
+    double ShipForwardAzimuth = 0; double ShipForwardElevation = 0;
+    Vector3D.GetAzimuthAndElevation(RCReferenceFrameVector, out ShipForwardAzimuth, out ShipForwardElevation);
+
+    NewYaw = ShipForwardAzimuth;
+    NewPitch = ShipForwardElevation;
+
+    ShipForwardAzimuth = ShipForwardAzimuth + DAMPINGGAIN * ((ShipForwardAzimuth - YawPrev) / Global_Timestep);
+    ShipForwardElevation = ShipForwardElevation + DAMPINGGAIN * ((ShipForwardElevation - PitchPrev) / Global_Timestep);
+
+    var REF_Matrix = MatrixD.CreateWorld(REF.GetPosition(), (Vector3)ShipForward, (Vector3)ShipUp).GetOrientation();
+    var Vector = Vector3.Transform((new Vector3D(ShipForwardElevation, ShipForwardAzimuth, 0)), REF_Matrix);
+    var TRANS_VECT = Vector3.Transform(Vector, Matrix.Transpose(GYRO.WorldMatrix.GetOrientation()));
+
+    if (double.IsNaN(TRANS_VECT.X) || double.IsNaN(TRANS_VECT.Y) || double.IsNaN(TRANS_VECT.Z))
+    { return; }
+
+    GYRO.Pitch = (float)MathHelper.Clamp((-TRANS_VECT.X) * GAIN, -1000, 1000);
+    GYRO.Yaw = (float)MathHelper.Clamp(((-TRANS_VECT.Y)) * GAIN, -1000, 1000);
+    GYRO.Roll = (float)MathHelper.Clamp(((-TRANS_VECT.Z)) * GAIN, -1000, 1000);
+    GYRO.GyroOverride = true;
+}
+
+public class WcPbApi
+{
+    private Action<ICollection<MyDefinitionId>> _getCoreWeapons;
+    private Action<ICollection<MyDefinitionId>> _getCoreStaticLaunchers;
+    private Action<ICollection<MyDefinitionId>> _getCoreTurrets;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<string, int>, bool> _getBlockWeaponMap;
+    private Func<long, MyTuple<bool, int, int>> _getProjectilesLockedOn;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float>> _getSortedThreats;
+    private Func<long, int, Sandbox.ModAPI.Ingame.MyDetectedEntityInfo> _getAiFocus;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _setAiFocus;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Sandbox.ModAPI.Ingame.MyDetectedEntityInfo> _getWeaponTarget;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int> _setWeaponTarget;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool, int> _fireWeaponOnce;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool, bool, int> _toggleWeaponFire;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, bool, bool, bool> _isWeaponReadyToFire;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, float> _getMaxWeaponRange;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, ICollection<string>, int, bool> _getTurretTargetTypes;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, ICollection<string>, int> _setTurretTargetTypes;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _setBlockTrackingRange;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _isTargetAligned;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, MyTuple<bool, Vector3D?>> _isTargetAlignedExtended;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _canShootTarget;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, Vector3D?> _getPredictedTargetPos;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _getHeatLevel;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _currentPowerConsumption;
+    private Func<MyDefinitionId, float> _getMaxPower;
+    private Func<long, bool> _hasGridAi;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool> _hasCoreWeapon;
+    private Func<long, float> _getOptimalDps;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, string> _getActiveAmmo;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, string> _setActiveAmmo;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Action<long, int, ulong, long, Vector3D, bool>> _monitorProjectile;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Action<long, int, ulong, long, Vector3D, bool>> _unMonitorProjectile;
+    private Func<ulong, MyTuple<Vector3D, Vector3D, float, float, long, string>> _getProjectileState;
+    private Func<long, float> _getConstructEffectiveDps;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long> _getPlayerController;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Matrix> _getWeaponAzimuthMatrix;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Matrix> _getWeaponElevationMatrix;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, bool, bool, bool> _isTargetValid;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, MyTuple<Vector3D, Vector3D>> _getWeaponScope;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, MyTuple<bool, bool>> _isInRange;
+
+    public bool Activate(Sandbox.ModAPI.Ingame.IMyTerminalBlock pbBlock)
+    {
+        var dict = pbBlock.GetProperty("WcPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(pbBlock);
+        if (dict == null) throw new Exception($"WcPbAPI failed to activate");
+        return ApiAssign(dict);
+    }
+
+    public bool ApiAssign(IReadOnlyDictionary<string, Delegate> delegates)
+    {
+        if (delegates == null)
+            return false;
+
+        AssignMethod(delegates, "GetCoreWeapons", ref _getCoreWeapons);
+        AssignMethod(delegates, "GetCoreStaticLaunchers", ref _getCoreStaticLaunchers);
+        AssignMethod(delegates, "GetCoreTurrets", ref _getCoreTurrets);
+        AssignMethod(delegates, "GetBlockWeaponMap", ref _getBlockWeaponMap);
+        AssignMethod(delegates, "GetProjectilesLockedOn", ref _getProjectilesLockedOn);
+        AssignMethod(delegates, "GetSortedThreats", ref _getSortedThreats);
+        AssignMethod(delegates, "GetAiFocus", ref _getAiFocus);
+        AssignMethod(delegates, "SetAiFocus", ref _setAiFocus);
+        AssignMethod(delegates, "GetWeaponTarget", ref _getWeaponTarget);
+        AssignMethod(delegates, "SetWeaponTarget", ref _setWeaponTarget);
+        AssignMethod(delegates, "FireWeaponOnce", ref _fireWeaponOnce);
+        AssignMethod(delegates, "ToggleWeaponFire", ref _toggleWeaponFire);
+        AssignMethod(delegates, "IsWeaponReadyToFire", ref _isWeaponReadyToFire);
+        AssignMethod(delegates, "GetMaxWeaponRange", ref _getMaxWeaponRange);
+        AssignMethod(delegates, "GetTurretTargetTypes", ref _getTurretTargetTypes);
+        AssignMethod(delegates, "SetTurretTargetTypes", ref _setTurretTargetTypes);
+        AssignMethod(delegates, "SetBlockTrackingRange", ref _setBlockTrackingRange);
+        AssignMethod(delegates, "IsTargetAligned", ref _isTargetAligned);
+        AssignMethod(delegates, "IsTargetAlignedExtended", ref _isTargetAlignedExtended);
+        AssignMethod(delegates, "CanShootTarget", ref _canShootTarget);
+        AssignMethod(delegates, "GetPredictedTargetPosition", ref _getPredictedTargetPos);
+        AssignMethod(delegates, "GetHeatLevel", ref _getHeatLevel);
+        AssignMethod(delegates, "GetCurrentPower", ref _currentPowerConsumption);
+        AssignMethod(delegates, "GetMaxPower", ref _getMaxPower);
+        AssignMethod(delegates, "HasGridAi", ref _hasGridAi);
+        AssignMethod(delegates, "HasCoreWeapon", ref _hasCoreWeapon);
+        AssignMethod(delegates, "GetOptimalDps", ref _getOptimalDps);
+        AssignMethod(delegates, "GetActiveAmmo", ref _getActiveAmmo);
+        AssignMethod(delegates, "SetActiveAmmo", ref _setActiveAmmo);
+        AssignMethod(delegates, "MonitorProjectile", ref _monitorProjectile);
+        AssignMethod(delegates, "UnMonitorProjectile", ref _unMonitorProjectile);
+        AssignMethod(delegates, "GetProjectileState", ref _getProjectileState);
+        AssignMethod(delegates, "GetConstructEffectiveDps", ref _getConstructEffectiveDps);
+        AssignMethod(delegates, "GetPlayerController", ref _getPlayerController);
+        AssignMethod(delegates, "GetWeaponAzimuthMatrix", ref _getWeaponAzimuthMatrix);
+        AssignMethod(delegates, "GetWeaponElevationMatrix", ref _getWeaponElevationMatrix);
+        AssignMethod(delegates, "IsTargetValid", ref _isTargetValid);
+        AssignMethod(delegates, "GetWeaponScope", ref _getWeaponScope);
+        AssignMethod(delegates, "IsInRange", ref _isInRange);
+        return true;
+    }
+
+    private void AssignMethod<T>(IReadOnlyDictionary<string, Delegate> delegates, string name, ref T field) where T : class
+    {
+        if (delegates == null)
+        {
+            field = null;
+            return;
+        }
+
+        Delegate del;
+        if (!delegates.TryGetValue(name, out del))
+            throw new Exception($"{GetType().Name} :: Couldn't find {name} delegate of type {typeof(T)}");
+
+        field = del as T;
+        if (field == null)
+            throw new Exception(
+                $"{GetType().Name} :: Delegate {name} is not type {typeof(T)}, instead it's: {del.GetType()}");
+    }
+
+    public void GetAllCoreWeapons(ICollection<MyDefinitionId> collection) => _getCoreWeapons?.Invoke(collection);
+
+    public void GetAllCoreStaticLaunchers(ICollection<MyDefinitionId> collection) =>
+        _getCoreStaticLaunchers?.Invoke(collection);
+
+    public void GetAllCoreTurrets(ICollection<MyDefinitionId> collection) => _getCoreTurrets?.Invoke(collection);
+
+    public bool GetBlockWeaponMap(Sandbox.ModAPI.Ingame.IMyTerminalBlock weaponBlock, IDictionary<string, int> collection) =>
+        _getBlockWeaponMap?.Invoke(weaponBlock, collection) ?? false;
+
+    public MyTuple<bool, int, int> GetProjectilesLockedOn(long victim) =>
+        _getProjectilesLockedOn?.Invoke(victim) ?? new MyTuple<bool, int, int>();
+
+    public void GetSortedThreats(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float> collection) =>
+        _getSortedThreats?.Invoke(pBlock, collection);
+
+    public MyDetectedEntityInfo? GetAiFocus(long shooter, int priority = 0) => _getAiFocus?.Invoke(shooter, priority);
+
+    public bool SetAiFocus(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, long target, int priority = 0) =>
+        _setAiFocus?.Invoke(pBlock, target, priority) ?? false;
+
+    public MyDetectedEntityInfo? GetWeaponTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId = 0) =>
+        _getWeaponTarget?.Invoke(weapon, weaponId);
+
+    public void SetWeaponTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long target, int weaponId = 0) =>
+        _setWeaponTarget?.Invoke(weapon, target, weaponId);
+
+    public void FireWeaponOnce(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, bool allWeapons = true, int weaponId = 0) =>
+        _fireWeaponOnce?.Invoke(weapon, allWeapons, weaponId);
+
+    public void ToggleWeaponFire(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, bool on, bool allWeapons, int weaponId = 0) =>
+        _toggleWeaponFire?.Invoke(weapon, on, allWeapons, weaponId);
+
+    public bool IsWeaponReadyToFire(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId = 0, bool anyWeaponReady = true,
+        bool shootReady = false) =>
+        _isWeaponReadyToFire?.Invoke(weapon, weaponId, anyWeaponReady, shootReady) ?? false;
+
+    public float GetMaxWeaponRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getMaxWeaponRange?.Invoke(weapon, weaponId) ?? 0f;
+
+    public bool GetTurretTargetTypes(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, IList<string> collection, int weaponId = 0) =>
+        _getTurretTargetTypes?.Invoke(weapon, collection, weaponId) ?? false;
+
+    public void SetTurretTargetTypes(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, IList<string> collection, int weaponId = 0) =>
+        _setTurretTargetTypes?.Invoke(weapon, collection, weaponId);
+
+    public void SetBlockTrackingRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, float range) =>
+        _setBlockTrackingRange?.Invoke(weapon, range);
+
+    public bool IsTargetAligned(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _isTargetAligned?.Invoke(weapon, targetEnt, weaponId) ?? false;
+
+    public MyTuple<bool, Vector3D?> IsTargetAlignedExtended(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _isTargetAlignedExtended?.Invoke(weapon, targetEnt, weaponId) ?? new MyTuple<bool, Vector3D?>();
+
+    public bool CanShootTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _canShootTarget?.Invoke(weapon, targetEnt, weaponId) ?? false;
+
+    public Vector3D? GetPredictedTargetPosition(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _getPredictedTargetPos?.Invoke(weapon, targetEnt, weaponId) ?? null;
+
+    public float GetHeatLevel(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _getHeatLevel?.Invoke(weapon) ?? 0f;
+    public float GetCurrentPower(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _currentPowerConsumption?.Invoke(weapon) ?? 0f;
+    public float GetMaxPower(MyDefinitionId weaponDef) => _getMaxPower?.Invoke(weaponDef) ?? 0f;
+    public bool HasGridAi(long entity) => _hasGridAi?.Invoke(entity) ?? false;
+    public bool HasCoreWeapon(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _hasCoreWeapon?.Invoke(weapon) ?? false;
+    public float GetOptimalDps(long entity) => _getOptimalDps?.Invoke(entity) ?? 0f;
+
+    public string GetActiveAmmo(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getActiveAmmo?.Invoke(weapon, weaponId) ?? null;
+
+    public void SetActiveAmmo(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, string ammoType) =>
+        _setActiveAmmo?.Invoke(weapon, weaponId, ammoType);
+
+    public void MonitorProjectileCallback(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, Action<long, int, ulong, long, Vector3D, bool> action) =>
+        _monitorProjectile?.Invoke(weapon, weaponId, action);
+
+    public void UnMonitorProjectileCallback(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, Action<long, int, ulong, long, Vector3D, bool> action) =>
+        _unMonitorProjectile?.Invoke(weapon, weaponId, action);
+
+    public MyTuple<Vector3D, Vector3D, float, float, long, string> GetProjectileState(ulong projectileId) =>
+        _getProjectileState?.Invoke(projectileId) ?? new MyTuple<Vector3D, Vector3D, float, float, long, string>();
+
+    public float GetConstructEffectiveDps(long entity) => _getConstructEffectiveDps?.Invoke(entity) ?? 0f;
+
+    public long GetPlayerController(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _getPlayerController?.Invoke(weapon) ?? -1;
+
+    public Matrix GetWeaponAzimuthMatrix(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponAzimuthMatrix?.Invoke(weapon, weaponId) ?? Matrix.Zero;
+
+    public Matrix GetWeaponElevationMatrix(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponElevationMatrix?.Invoke(weapon, weaponId) ?? Matrix.Zero;
+
+    public bool IsTargetValid(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetId, bool onlyThreats, bool checkRelations) =>
+        _isTargetValid?.Invoke(weapon, targetId, onlyThreats, checkRelations) ?? false;
+
+    public MyTuple<Vector3D, Vector3D> GetWeaponScope(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponScope?.Invoke(weapon, weaponId) ?? new MyTuple<Vector3D, Vector3D>();
+    public MyTuple<bool, bool> IsInRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock block) =>
+        _isInRange?.Invoke(block) ?? new MyTuple<bool, bool>();
+}

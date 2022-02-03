@@ -1,0 +1,1846 @@
+/*
+ * R e a d m e
+ * -----------
+ * missile script 1.1.8
+ * 
+ * by sprinkles
+ * proportional navigation by alysius (https://github.com/wellstat/SpaceEngineers/blob/master/IngameScripts/DiamondDomeDefense.cs)
+ * 
+ * 
+ * this is a more advanced missile script, requiring extensive setup.
+ * If you want a simpler one (albeit with less options), use my port of RDAV (i made it so it can use config from customdata);
+ * 
+ * 
+ * commands:
+ * single -> fire single missile
+ * launch x -> launch x missiles
+ * autofire -> toggle autofire
+ * starburst -> toggle starburst pattern (missiles will fan out to make turret targeting a bit harder)
+ * retarget -> retarget
+ * SPIRAL: REMOVED DUE TO POSSIBLE EXPLOIT
+ * 
+ * you can only launch when you selected a target through weaponcore.
+ * 
+ * Please use the missilemapper to correctly store offsets in your merge block (https://steamcommunity.com/sharedfiles/filedetails/?id=2475214737) I WILL ALSO SUBMIT THIS FOR THE WHITELIST
+ * mapper for the starcore missile. merge block must be called "missilemerge" !!!! IMPORTANT
+ * after you placed all essential components on a missile (missile must have: power, control, thrust, remote control. Optional: warhead.), place a pb on it and run the mapper script.
+ * mapper script will ahtomatically write data to the merge block. that missile design is then locked in! you must run it again if your missile's core parts change
+ * 
+ * you can launch a certain missile group, make sure to include |group X| into your merge block's customname
+ * if anything is unclear, leave a comment on the workshop page. do not PM me about this script.
+ * 
+ * 
+ * ///
+ * ; --------------------------------- CONFIGURATION --------------------------------- 
+ * ;sprinkles missile manager 1.1.7
+ * [main]
+ * referenceblockname=missilemerge
+ * launchdelay=400
+ * guidancedelaymin=1700
+ * guidancedelaymax=5000
+ * sprayrandomization=0.5
+ * spraydisabledist =50
+ * rollrpm=0
+ * starburstoffsetdist=1500
+ * starburstdisabledist=2500
+ * retarget_autodisabletime=2000
+ * ;
+ * [mergedetach]
+ * cluster=true
+ * clusterstring=clustermerge
+ * cluster_detachrange=400
+ * cluster_detachdelay=200
+ * cluster_detachspin=false
+ * detachspin_rpm=0
+ * [new]
+ * preexplode_ticks=15
+ * newexplodeoffset=true
+ * startup_idletime=3000
+ * [errorlog]
+ * ;
+ * ;lasterror TODO
+ * ;xxxxxx = ini.Get("mergedetach", "xxxxxxx").ToInt32();
+ * 
+ */
+
+
+// ----------------------------------------------- CONFIG SECTION (PARSED FROM CUSTOMDATA) -----------------------------------------------
+bool runningwithoutconfig = false; //has config succesfully parsed?
+//cfg (parse from customdata, this is standard setup.)
+string referenceblockname = "missilemerge"; //reference block name
+int launchdelay = 400; //launch delay for autolaunch (ms)
+int guidancedelaymin = 1700; //min time after which missile guidance is activated (ms)
+int guidancedelaymax = 5000; //max time after which missile guidance is activated (ms)
+double sprayrandomization = 0.5;
+int spraydisabledist = 50; //spray is set to grid center if missile has come within this distance
+int rollrpm = 0;
+int starburstoffsetdist = 400;
+int starburstdisabledist = 2500;
+int retarget_autodisabletime = 2000; //disable forced retarget after x ms
+
+
+//merge detaching
+bool cluster = true;
+string clusterstring = "clustermerge";
+int cluster_detachrange = 400;
+int cluster_detachdelay = 200; //ms
+bool cluster_detachspin = false; //spin while detaching
+int detachspin_rpm = 0;
+
+//PMW threat warning and intercept TODO
+bool threatwarning = true;
+bool autointercept = true;
+int interceptiondst = 900;
+
+
+//new vars 1.1.7
+int preexplode_ticks = 15;
+bool newexplodeoffset = true;
+//int startup_idletime = 0; //disables thruster and all guidance after launch for this amount of seconds.
+
+// ----------------------------------------------- END OF CONFIG SECTION -----------------------------------------------
+
+
+//vars
+gridinfo mygridinfo = new gridinfo();
+Dictionary<long, gridinfo> gridresolver = new Dictionary<long, gridinfo>();
+List<IMyShipMergeBlock> missilemergers = new List<IMyShipMergeBlock>(); //keep this global for diagnostics
+List<missile> missilelist = new List<missile>();
+List<missile> launchedmissiles = new List<missile>();
+Random random = new Random();
+string version = "1.1.8-STABLE";
+
+
+//args
+bool starburst = true;
+int launches_remaining; //# of launches still requested
+bool autolaunch = false;
+double lastlaunch = 0;
+bool retarget = false;
+double retarget_activationtimestamp = 0;
+int limit_to_group = 0; //restrict launches to group 1-10.
+
+
+//time management
+int totalscriptruns = 1;
+Queue<double> runtimes = new Queue<double>();
+double ticktime_ms = 16.66667; //tick time in ms
+double ticktime_s = 0.016667; //tick time in s
+double totalruntime_ms = 0;
+
+//api
+WcPbApi weaponapi = new WcPbApi();
+//PbApiWrapper shieldapi;
+
+
+
+public void Main(string argument, UpdateType updateSource)
+{
+    //script IO, performance
+    totalruntime_ms = totalscriptruns * ticktime_ms;
+    try
+    {
+        while (runtimes.Count > 100) { runtimes.Dequeue(); }
+        if (totalscriptruns % 5 == 0 && totalscriptruns > 50) { runtimes.Enqueue(Runtime.LastRunTimeMs); } //probe every 5 ticks. skip setup (50 ticks)
+
+        print_diagnostics();
+        handle_arguments(argument);
+    } catch (Exception e) { logerror("Exception in diagnostics/arg parsing: " + e.Message); }
+    if (retarget && retarget_activationtimestamp + retarget_autodisabletime < totalruntime_ms) { retarget = false; } //retarget logic
+
+    //threats
+    Dictionary<MyDetectedEntityInfo, float> detections = new Dictionary<MyDetectedEntityInfo, float>();
+    weaponapi.GetSortedThreats(Me, detections);
+    Echo("Enemies: " + detections.Count);
+    MyDetectedEntityInfo? focustarget = weaponapi.GetAiFocus(Me.EntityId);
+    Echo("Focused target?: " + focustarget.HasValue);
+   // List<MyDetectedEntityInfo> obstructions = new List<MyDetectedEntityInfo>(); nyi
+   // weaponapi.GetObstructions(Me, obstructions);
+
+    try //resolve grids
+    {
+        resolvegrids(detections);
+    }
+    catch (Exception e) { logerror("Exception in grid resolver: " + e.Message); }
+
+    try //new launch
+    {
+        launch_handler(detections, focustarget);
+    } catch (Exception e) { logerror("Exception in firing sequencer: " + e.Message);}
+
+    //missile update & guidance
+    for (int i = launchedmissiles.Count - 1; i >= 0; i--)
+    {
+        try
+        {
+            missile mis = launchedmissiles[i];
+            bool oldtargetseen = false;
+            foreach (KeyValuePair<MyDetectedEntityInfo, float> detection in detections) //update detection info
+            {
+                if (mis.target.entityid == detection.Key.EntityId) //target matches, update it.
+                {
+                    oldtargetseen = true;
+                    while (mis.target.movementdata.Count > 15)
+                    {
+                        mis.target.movementdata.Dequeue();
+                    }
+                    while (mis.target.movementdata.Count < 3)
+                    {
+                        movementinfo movementdata_t = new movementinfo(totalruntime_ms, detection.Key, detection.Key.Position, detection.Key.Velocity);
+                        mis.target.movementdata.Enqueue(movementdata_t);
+                    }
+                    movementinfo movementdata = new movementinfo(totalruntime_ms, detection.Key, detection.Key.Position, detection.Key.Velocity);
+                    mis.target.movementdata.Enqueue(movementdata);
+                }
+            }
+            if ((oldtargetseen == false || retarget) && weaponapi.GetAiFocus(Me.EntityId).HasValue) //switch target if new focus and old target is no longer visible/viable
+            {
+                MyDetectedEntityInfo targ = weaponapi.GetAiFocus(Me.EntityId).Value;
+                mis.target.entityid = targ.EntityId;
+                mis.target.movementdata.Clear();
+                while (mis.target.movementdata.Count < 3)
+                {
+                    movementinfo movementdatat = new movementinfo(totalruntime_ms, targ, targ.Position, targ.Velocity);
+                    mis.target.movementdata.Enqueue(movementdatat);
+                }
+
+            }
+            else if(oldtargetseen == false && !weaponapi.GetAiFocus(Me.EntityId).HasValue)
+            {
+                continue;
+            }
+            //todo otherwise just go for first available threat. maybe come to a stop nearby parent grid?
+
+            MyDetectedEntityInfo target = mis.target.movementdata.ElementAt(mis.target.movementdata.Count - 1).detectedentityinfo;    //focustarget.Value; //meh
+            if (!checkandupdatemissile(i))
+            {
+                launchedmissiles.RemoveAt(i);
+                return;
+            }
+            mis.currentposition = mis.gyros[0].GetPosition(); //update missile pos
+            mis.velocity = (mis.currentposition - mis.previousposition) / ticktime_s; //velocity in m/s
+
+
+            if (mis.idletime > 0 && (mis.launchtime_real + mis.idletime) < totalruntime_ms)
+            {
+                foreach(IMyThrust thruster in mis.thrusters)
+                {
+                    thruster.ThrustOverridePercentage = 1;
+                }
+            }
+
+            if (mis.launchtime < totalruntime_ms) //home on target after a randomized delay that is baked into launchtime in the constructor.
+            {
+
+
+                if (newexplodeoffset && gridresolver.ContainsKey(target.EntityId))
+                {
+                    double alignmentcorrection = Math.Max(1 / gridresolver[target.EntityId].bestalignment + 0.01, 10);
+
+
+                    //next missile pos: position + overpenetration, according to config - underpenetration, relative to the boundingbox resolution
+                    Vector3D nextmissilepos = mis.gyros[0].CubeGrid.WorldAABB.Center + (mis.velocity * ticktime_s * preexplode_ticks) - (alignmentcorrection * (mis.velocity * ticktime_s)); //I need overpenetration at a low alignment, i need underpenetration at a low alignment.
+                    //TEMP: Explode when it enters the custom boundingbox
+                    //create boundingbox based on local min, max:
+
+                    BoundingBoxD localboundingbox = gridresolver[target.EntityId].shiplocalbounding;
+                    MatrixD shipmatrix = MatrixD.CreateWorld(target.Position, target.Orientation.Forward, target.Orientation.Up);
+                    MyTransform localtoworld = new MyTransform(shipmatrix);
+
+                    Vector3 targetpoint_min = localboundingbox.Min;
+                    Vector3 targetpoint_max = localboundingbox.Max;
+                    Vector3D min_world = MyTransform.Transform(ref targetpoint_min, ref localtoworld);
+                    Vector3D max_world = MyTransform.Transform(ref targetpoint_max, ref localtoworld);
+
+                    //shitty. i have no time :( dont ever do it this way, kids.
+                    BoundingBoxD worldboundingbox = new BoundingBoxD();
+                    List<Vector3D> points = new List<Vector3D>();
+                    points.Add(min_world);
+                    points.Add(max_world);
+                    BoundingBoxD unused = BoundingBoxD.CreateFromPoints(points);
+                    worldboundingbox = unused;
+
+                    /*
+                            if (totalscriptruns % 200 == 0)
+                            {
+                                logerror("min" + ((Vector3I)(worldboundingbox.Min)).ToString() );
+                                logerror("max" + ((Vector3I)(worldboundingbox.Max)).ToString());
+                                logerror("missilepos" + ((Vector3I)mis.gyros[0].GetPosition()).ToString());
+                                logerror("Targetpos:" + ((Vector3I)target.Position).ToString());
+                                logerror("dist" + worldboundingbox.Distance(target.Position));
+                                logerror("pos:" + worldboundingbox.Contains(target.Position).ToString());
+                            }
+                            */
+                    //todo improve
+                    if (worldboundingbox.Contains(nextmissilepos) == ContainmentType.Contains || (worldboundingbox.Contains(nextmissilepos) == ContainmentType.Intersects && gridresolver[target.EntityId].bestalignment > 0.5))
+                    {
+
+
+                        foreach (var warhead in mis.warheads)
+                        {
+                            warhead.IsArmed = true;
+                            warhead.Detonate();
+                            logerror("warhead!!!");
+                        }
+                    }
+                }
+                else //use old method
+                {
+                    Vector3D nextmissilepos = mis.gyros[0].CubeGrid.WorldAABB.Center - ((mis.explosiontickrnd / 60.0f) * mis.velocity); //random overpenetration as we dont use camera
+                    if (target.BoundingBox.Contains(nextmissilepos) == ContainmentType.Contains)
+                    {
+                        foreach (var warhead in mis.warheads)
+                        {
+                            warhead.IsArmed = true;
+                            warhead.Detonate();
+                        }
+                    }
+                }
+
+                aimattarget(refreshnavigation(ref mis), mis);
+                handlecluster(ref mis, totalruntime_ms, target.Position);
+            }
+            //missile guidance run complete. update the previous position
+            mis.previousposition = mis.currentposition;
+            launchedmissiles[i] = mis; //write missile stats
+
+        }
+        catch (Exception e) {  logerror ("Exception in guidance update: " + e.Message); }
+    }
+    if (totalscriptruns == 0 || (lastlaunch + 3000 < totalruntime_ms && totalscriptruns % 100 == 0)) //refresh every 1.5s, 3 sec after last missile has launched
+    {
+        refreshmergers();
+        collectmissiles(missilemergers); //does error handling as well
+        if (missilelist.Count < 1)
+            autolaunch = false;
+    }
+    totalscriptruns++;
+} //end main
+
+public Program() //one-time init
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update1;
+    weaponapi.Activate(Me);
+    //shieldapi = new PbApiWrapper(Me); not yet implemented into script logic.
+
+    //config
+    retrievesettings(Me.CustomData);
+}
+
+//-------------------------------------------- GENERAL UTILITY --------------------------------------------
+void handle_arguments(string argument)
+{
+    if (argument.ToLower().Equals("single"))
+    {
+        launches_remaining++;
+    }
+    else if (argument.ToLower().Equals("autolaunch"))
+    {
+        autolaunch = !autolaunch;
+    }
+    else if (argument.ToLower().Equals("starburst"))
+    {
+        starburst = !starburst;
+    }
+    else if (argument.ToLower().Equals("retarget"))
+    {
+        retarget = !retarget;
+        if (retarget) { retarget_activationtimestamp = totalruntime_ms; }
+    }
+    else if (argument.ToLower().Contains("launch")) //launch X amount
+    {
+        int amount;
+        int.TryParse(System.Text.RegularExpressions.Regex.Match(argument.ToLower(), @"[0-9]+").Value, out amount);
+        if (amount > 0)
+        {
+            launches_remaining = amount;
+        }
+    }
+    else if (argument.ToLower().Contains("group")) //limit launching to 1 specific group. invalid entries result in this being ignored (ex. group 99 to reset)
+    {
+        int amount;
+        int.TryParse(System.Text.RegularExpressions.Regex.Match(argument.ToLower(), @"[0-9]+").Value, out amount);
+        if (amount > 0)
+        {
+            limit_to_group = amount;
+        }
+    }
+    else if (argument.ToLower().Equals("doraycast"))
+    {
+        doraycast();
+    }
+    else if (argument.ToLower().Equals("removeraycast"))
+    {
+        raycast = false;
+    }
+}
+
+bool raycast = false;
+void doraycast() //finish implementation
+{
+    raycast = true;
+    List<IMyCameraBlock> cams = new List<IMyCameraBlock>();
+    GridTerminalSystem.GetBlocksOfType<IMyCameraBlock>(cams, cam => cam.IsActive);
+    IMyCameraBlock camera;
+    if (cams.Count == 1)
+    {
+        camera = cams[0];
+    }
+    else {return;}
+
+    Vector3D fwd = camera.WorldMatrix.Forward;
+    Vector3D from = camera.GetPosition();
+    Vector3D to = camera.GetPosition() + fwd * 10000; //10km virtual raycast
+    LineD line = new LineD(from, to);
+
+
+    BoundingBoxD testboundingbox;
+    List<Vector3D> keeeenlist = new List<Vector3D>(); //TODO fill the list.
+    testboundingbox = BoundingBoxD.CreateFromPoints(keeeenlist);
+
+    //we now have a boundingbox, and our line. calculate boundinbox entry, and exit points. then subtract em from eachother.
+
+
+
+
+
+}
+
+void print_diagnostics()
+{
+    if (runningwithoutconfig)
+        Echo("CRITICAL: RUNNING WITHOUT CONFIG");
+    Echo("Ver: " + version + " - " + totalscriptruns);
+    Echo("SPRNK Runtime: " + Math.Round(Runtime.LastRunTimeMs, 3) + " Ms");
+    if (runtimes.Count > 1)
+        Echo("SPRNK Avg runtime: " + Math.Round(runtimes.Average(), 3) + " Ms");
+    Echo("\n");
+    Echo("merges: " + missilemergers.Count);
+    Echo("missiles:" + missilelist.Count);
+    Echo("in air: " + launchedmissiles.Count);
+}
+bool launch_handler(Dictionary<MyDetectedEntityInfo, float> detections, MyDetectedEntityInfo? focustarget)//only returns false on launch error
+{
+    bool tubeready = lastlaunch + launchdelay < totalruntime_ms; //missile launch delay
+    bool target_isenemy = focustarget.Value.Relationship == MyRelationsBetweenPlayerAndBlock.Enemies;
+    if (missilelist.Count > 0 && focustarget.HasValue && target_isenemy && (autolaunch || launches_remaining > 0) && tubeready) //launch next available missile
+    {
+        missile mis = missilelist.Last();
+
+        if (limit_to_group > 0 && limit_to_group < 10) //ugly hardcode...
+        {
+            bool foundmissile = false;
+            for (int i = missilelist.Count - 1; i >= 0; i--)
+            {
+                if (missilelist[i].missilegroup == limit_to_group)
+                {
+                    mis = missilelist[i];
+                    foundmissile = true;
+                }
+            }
+            if (!foundmissile) { return false; }
+        }
+        if (!initlaunch(mis, totalruntime_ms, focustarget.Value)) //missile is borked
+        {
+            missilelist.RemoveAt(missilelist.Count - 1);
+            return false;
+        }
+        if (launches_remaining > 0)
+            launches_remaining--;
+
+        lastlaunch = totalruntime_ms;
+    }
+    return true;
+}
+bool customdatacontainsvariables(string customdata)
+{
+    //contains header sections?
+    if (!customdata.Contains("[main]") ||
+        !customdata.Contains("[mergedetach]") ||
+        !customdata.Contains("[new]")
+        ) { return false; };
+
+    //variables under main
+    if (!customdata.Contains("referenceblockname") ||
+    !customdata.Contains("launchdelay") ||
+    !customdata.Contains("guidancedelaymin") ||
+    !customdata.Contains("guidancedelaymax") ||
+    !customdata.Contains("sprayrandomization") ||
+    !customdata.Contains("spraydisabledist") ||
+    !customdata.Contains("rollrpm") ||
+    !customdata.Contains("starburstoffsetdist") ||
+    !customdata.Contains("starburstdisabledist") ||
+    !customdata.Contains("retarget_autodisabletime")
+    ) { return false; }
+    //variables under mergedetach
+    if (!customdata.Contains("cluster") ||
+        !customdata.Contains("clusterstring") ||
+        !customdata.Contains("cluster_detachrange") ||
+        !customdata.Contains("cluster_detachdelay") ||
+        !customdata.Contains("cluster_detachspin") ||
+        !customdata.Contains("detachspin_rpm")
+    ) { return false; }
+
+    //variables under new
+    if (!customdata.Contains("preexplode_ticks") ||
+        !customdata.Contains("newexplodeoffset")
+    ) { return false; }
+    return true;
+}
+void retrievesettings(string customdata)//only do once
+{
+    MyIni ini = new MyIni();//new object!
+    try
+    {
+        MyIniParseResult result;
+        if (ini.TryParse(customdata, out result) && customdatacontainsvariables(customdata))
+        {
+            //parse main config
+            referenceblockname = ini.Get("main", "referenceblockname").ToString();
+            launchdelay = ini.Get("main", "launchdelay").ToInt32();
+            guidancedelaymin = ini.Get("main", "guidancedelaymin").ToInt32();
+            guidancedelaymax = ini.Get("main", "guidancedelaymax").ToInt32();
+            sprayrandomization = ini.Get("main", "sprayrandomization").ToDouble();
+            spraydisabledist = ini.Get("main", "spraydisabledist").ToInt32();
+            rollrpm = ini.Get("main", "rollrpm").ToInt32();
+            starburstoffsetdist = ini.Get("main", "starburstoffsetdist").ToInt32();
+            starburstdisabledist = ini.Get("main", "starburstdisabledist").ToInt32();
+            retarget_autodisabletime = ini.Get("main", "retarget_autodisabletime").ToInt32();
+
+            //parse merge detach config
+            cluster = ini.Get("mergedetach", "cluster").ToBoolean();
+            clusterstring = ini.Get("mergedetach", "clusterstring").ToString();
+            cluster_detachrange = ini.Get("mergedetach", "cluster_detachrange").ToInt32();
+            cluster_detachdelay = ini.Get("mergedetach", "cluster_detachdelay").ToInt32();
+            cluster_detachspin = ini.Get("mergedetach", "cluster_detachspin").ToBoolean();
+            detachspin_rpm = ini.Get("mergedetach", "detachspin_rpm").ToInt32();
+
+            preexplode_ticks = ini.Get("new", "preexplode_ticks").ToInt32();
+            newexplodeoffset = ini.Get("new", "newexplodeoffset").ToBoolean();
+        }
+        else { runningwithoutconfig = true; restoresettings(); };
+    }
+    catch (Exception e) { runningwithoutconfig = true; restoresettings(); }
+}
+void restoresettings() //standard settings
+{
+    //cfg (parse from customdata, this is standard setup.)
+     referenceblockname = "missilemerge"; //reference block name
+     launchdelay = 400; //launch delay for autolaunch (ms)
+     guidancedelaymin = 1700; //min time after which missile guidance is activated (ms)
+     guidancedelaymax = 5000; //max time after which missile guidance is activated (ms)
+     sprayrandomization = 0.5;
+     spraydisabledist = 50; //spray is set to grid center if missile has come within this distance
+     rollrpm = 0;
+     starburstoffsetdist = 400;
+     starburstdisabledist = 2500;
+     retarget_autodisabletime = 2000; //disable forced retarget after x ms
+    //merge detaching
+     cluster = true;
+     clusterstring = "clustermerge";
+     cluster_detachrange = 400;
+     cluster_detachdelay = 200; //ms
+     cluster_detachspin = false; //spin while detaching
+     detachspin_rpm = 0;
+
+
+    //new
+    preexplode_ticks = 15;
+    newexplodeoffset = true;
+}
+void logerror(string message)
+{
+    DateTime currenttime = DateTime.Now;
+    string time = currenttime.ToString(System.Globalization.CultureInfo.CreateSpecificCulture("nl-NL"));
+    try
+    {
+        //add it to cockpit
+        List<IMyCockpit> cockpits = new List<IMyCockpit>();
+        GridTerminalSystem.GetBlocksOfType<IMyCockpit>(cockpits);
+        if (cockpits.Count > 1)
+        {
+            cockpits[0].CustomData += "\n;" + time + " : " + message;
+        }
+    }
+    catch (Exception e) { }
+
+
+
+}
+
+
+//-------------------------------------------- RESOLVER --------------------------------------------
+
+struct gridinfo
+{
+    public BoundingBoxD shiplocalbounding;
+    public double bestalignment;
+    public double timestamp;
+
+    public gridinfo(BoundingBoxD shiplocalbounding, double bestalignment)
+    {
+        this.shiplocalbounding = new BoundingBoxD();
+        this.bestalignment = 0d;
+        this.timestamp = 0;
+    }
+}
+
+void resolvegrids(Dictionary<MyDetectedEntityInfo, float> detections)
+{
+    foreach (KeyValuePair<MyDetectedEntityInfo, float> detection in detections)
+    {
+        if (gridresolver.ContainsKey(detection.Key.EntityId)) //update
+        {
+            gridresolver[detection.Key.EntityId] = update_customboundingbox(gridresolver[detection.Key.EntityId], detection.Key);
+        }
+        else //add new
+        {
+            gridinfo gridinfo = new gridinfo();
+            gridinfo = update_customboundingbox(gridinfo, detection.Key);
+            gridresolver.Add(detection.Key.EntityId, gridinfo);
+        }
+    }
+}
+
+
+gridinfo update_customboundingbox(gridinfo gridinfo, MyDetectedEntityInfo enemy)
+{
+    double bestalignment = 0.0d;
+    bestalignment = Math.Abs(enemy.Orientation.Forward.Dot(Vector3D.Forward));
+    bestalignment = Math.Max(Math.Abs(enemy.Orientation.Forward.Dot(Vector3D.Up)), bestalignment);
+    bestalignment = Math.Max(Math.Abs(enemy.Orientation.Forward.Dot(Vector3D.Right)), bestalignment);
+
+    if (bestalignment > gridinfo.bestalignment)
+    {
+        MatrixD world = MatrixD.CreateWorld(enemy.Position, enemy.Orientation.Forward, enemy.Orientation.Up);
+        MyTransform WorldToLocal = new MyTransform(MatrixD.Invert(world));
+        gridinfo.shiplocalbounding = BoundingBoxD.CreateInvalid();
+
+        Vector3 localMin = enemy.BoundingBox.Min;
+        localMin = MyTransform.Transform(ref localMin, ref WorldToLocal);
+        gridinfo.shiplocalbounding.Include(localMin);
+
+        Vector3 localMax = enemy.BoundingBox.Max;
+        localMax = MyTransform.Transform(ref localMax, ref WorldToLocal);
+        gridinfo.shiplocalbounding.Include(localMax);
+
+        gridinfo.bestalignment = bestalignment;
+    }
+    return gridinfo;
+}
+
+Vector3D gettargetonship(Vector3 ShipPosition, MatrixD Orientation, Vector3 randomization, BoundingBoxD localboundingbox, double bestalignment)
+{
+    MatrixD ShipMatrix = MatrixD.CreateWorld(ShipPosition, Orientation.Forward, Orientation.Up);
+    MyTransform LocalToWorld = new MyTransform(ShipMatrix);
+
+    Vector3 TargetPoint = new Vector3(
+        randomization.X * localboundingbox.HalfExtents.X * bestalignment,
+        randomization.Y * localboundingbox.HalfExtents.Y * bestalignment,
+        randomization.Z * localboundingbox.HalfExtents.Z * bestalignment
+    );
+    return MyTransform.Transform(ref TargetPoint, ref LocalToWorld);
+}
+
+
+
+
+
+
+//-------------------------------------------- MISSILE TARGET LOGIC --------------------------------------------
+
+
+
+
+public struct target
+{
+    public long entityid;
+    public Queue<movementinfo> movementdata;
+    public target(long entid)
+    {
+        this.entityid = entid;
+        this.movementdata = new Queue<movementinfo>();
+    }
+}
+public struct movementinfo
+{
+    public double timestamp;
+    public MyDetectedEntityInfo detectedentityinfo;
+    public Vector3D position;
+    public Vector3D velocity;
+    public movementinfo(double timestamp, MyDetectedEntityInfo detectedentityinfo, Vector3D position, Vector3D velocity)
+    {
+        this.timestamp = timestamp;
+        this.detectedentityinfo = detectedentityinfo;
+        this.position = position;
+        this.velocity = velocity;
+    }
+}
+
+
+
+bool initlaunch(missile mis, double currentrunms, MyDetectedEntityInfo target)
+{
+    mis.mergeblock.ApplyAction("OnOff_Off");
+    foreach (var thruster in mis.thrusters)
+    {
+        if (!isblockfunctional(thruster, mis.mergeblock)) { return false; }
+        thruster.ApplyAction("OnOff_On");
+
+        if (mis.idletime == 0)
+        {
+            thruster.ThrustOverridePercentage = 1;
+        }
+        else
+        {
+            thruster.ThrustOverridePercentage = 0;
+        }
+    }
+    foreach (var battery in mis.batterys)
+    {
+        if (!isblockfunctional(battery, mis.mergeblock)) { return false; }
+    }
+    foreach (var gyro in mis.gyros)
+    {
+        if (!isblockfunctional(gyro, mis.mergeblock)) { return false; }
+        gyro.ApplyAction("OnOff_On");
+        gyro.GyroOverride = true;
+    }
+    /*
+            foreach (var remote in mis.remotes)
+            {
+                if (!isblockfunctional(remote, mis.mergeblock)) { return; }
+            }
+            */
+    mis.launched = true;
+    mis.launchtime = currentrunms + random.Next(guidancedelaymin, guidancedelaymax) + mis.idletime;
+    mis.launchtime_real = currentrunms;
+    mis.lastinputyaw = 0;
+    mis.lastinputroll = 0;
+    mis.lastinputpitch = 0;
+    mis.explosiontickrnd = random.Next(0, 20);
+    mis.sprayoffset = randomspray(sprayrandomization);
+    mis.previousposition = mis.gyros[0].GetPosition();
+    mis.currentposition = mis.gyros[0].GetPosition();
+    mis.velocity = Vector3D.Zero;
+    mis.starburstoffset = Vector3D.Zero;
+    mis.starburst_tripped = false;
+
+    mis.lastclusterdetach = 0;
+
+    InitPIDControllers(ref mis);
+    initgyro(ref mis);
+    mis.target = new target(target.EntityId);
+    launchedmissiles.Add(mis);
+
+    missilelist.RemoveAt(missilelist.Count - 1);
+    lastlaunch = currentrunms;
+    return true;
+}
+
+
+//-------------------------------------------- NAV LOGIC --------------------------------------------
+Vector3D refreshnavigation(ref missile missile)
+{
+    Queue<movementinfo> movementdata = missile.target.movementdata;
+    Vector3D lastpos = movementdata.ElementAt(movementdata.Count - 2).position;
+    Vector3D currentpos = movementdata.ElementAt(movementdata.Count - 1).position;
+    Vector3D lastvel = movementdata.ElementAt(movementdata.Count - 2).velocity;
+    Vector3D currentvel = movementdata.ElementAt(movementdata.Count - 1).velocity;
+    double deltatimems = movementdata.ElementAt(movementdata.Count - 1).timestamp - movementdata.ElementAt(movementdata.Count - 2).timestamp;
+
+
+    MyDetectedEntityInfo enemygrid = movementdata.ElementAt(movementdata.Count - 1).detectedentityinfo; //last detection
+
+
+    //Vector3D targetpredictedpos = applyspray_boundingbox(currentpos, missile.sprayoffset, movementdata.ElementAt(movementdata.Count - 1).detectedentityinfo.BoundingBox);
+
+    //MatrixD orientation = missile.batterys[0].WorldMatrix;
+
+    Vector3D targetpredictedpos = enemygrid.Position;
+
+
+    if (gridresolver.ContainsKey(enemygrid.EntityId))
+    {
+        targetpredictedpos = gettargetonship(enemygrid.Position, enemygrid.Orientation, missile.sprayoffset, gridresolver[enemygrid.EntityId].shiplocalbounding, gridresolver[enemygrid.EntityId].bestalignment);
+    }
+    else {logerror("WARN: Target was not resolved before nav!");}
+
+
+    Echo("predictedpos:" + targetpredictedpos.ToString());
+
+    targetpredictedpos += (currentvel * ((double)deltatimems / 1000));
+
+    Vector3D rangeVector = targetpredictedpos - missile.gyros[0].WorldMatrix.Translation;
+
+    var distTarget = rangeVector.Length();
+    rangeVector += missile.starburstoffset;
+
+
+    //Vector3D grav = missile.remotes[0].GetNaturalGravity(); no grav support yet! can maybe get cockpit grav.
+
+    //IMyShipController controller = missile.remotes[0];
+    MyDetectedEntityInfo target = missile.target.movementdata.ElementAt(movementdata.Count - 1).detectedentityinfo;
+    Vector3D linearVelocity = missile.velocity;
+    Vector3D velocityVector = target.Velocity - linearVelocity;
+    double speed = missile.velocity.Length();
+
+
+    if (starburst && !missile.starburst_tripped && missile.clustermerges.Count < 1) //dont do starburst on clustermissiles
+    {
+        missile.starburst_tripped = true;
+
+        var perp = new Vector3D(1, 1, -(rangeVector.X + rangeVector.Y) / rangeVector.Z);
+
+        var coperp = perp.Cross(rangeVector);
+        perp.Normalize();
+        coperp.Normalize();
+
+        var rand = new Random();
+        var theta = rand.NextDouble() * Math.PI * 2;
+        var dist = -rangeVector;
+        dist.Normalize();
+        dist *= 1200;
+        missile.starburstoffset = perp * Math.Sin(theta) + coperp * Math.Cos(theta);
+        missile.starburstoffset *= starburstoffsetdist;
+        // TrickshotOffset += dist;
+
+    }
+    if (starburst && missile.starburst_tripped && distTarget < starburstdisabledist)
+    {
+        missile.starburstoffset = Vector3D.Zero;
+    }
+
+
+    if (linearVelocity.Dot(ref rangeVector) > 0)
+    {
+        Vector3D rangeDivSqVector = rangeVector / rangeVector.LengthSquared();
+        Vector3D compensateVector = velocityVector - (velocityVector.Dot(ref rangeVector) * rangeDivSqVector);
+        Vector3D targetANVector;
+        var targetAccel = (lastvel - currentvel) * ticktime_s;
+
+        //targetANVector = targetAccel - grav - (targetAccel.Dot(ref rangeVector) * rangeDivSqVector);
+        targetANVector = targetAccel - (targetAccel.Dot(ref rangeVector) * rangeDivSqVector);
+
+        if (speed > missile.lastSpeed + 1)
+        {
+            missile.AccelerationVector = linearVelocity + (3.5 * 1.5 * (compensateVector + (0.5 * targetANVector)));
+        }
+        else
+        {
+            missile.AccelerationVector = linearVelocity + (3.5 * (compensateVector + (0.5 * targetANVector)));
+        }
+    }
+    else
+    {
+        missile.AccelerationVector = (rangeVector * 0.1) + velocityVector;
+    }
+
+    missile.lastTargetVelocity = target.Velocity;
+    missile.lastSpeed = speed;
+
+    return Vector3D.TransformNormal(missile.AccelerationVector, MatrixD.Transpose(missile.batterys[0].WorldMatrix));
+}
+double FastAT(double x)
+{
+    return 0.785375 * x - x * (x - 1.0) * (0.2447 + 0.0663 * x);
+}
+double GetSign(double value)
+{
+    return value < 0 ? -1 : 1;
+}
+
+void aimattarget(Vector3D TargetVector, missile mis)
+{
+
+
+
+    //---------- Activate Gyroscopes To Turn Towards Target ----------
+
+    double absX = Math.Abs(TargetVector.X);
+    double absY = Math.Abs(TargetVector.Y);
+    double absZ = Math.Abs(TargetVector.Z);
+
+    double yawInput, pitchInput;
+    if (absZ < 0.00001)
+    {
+        yawInput = pitchInput = MathHelperD.PiOver2;
+    }
+    else
+    {
+        bool flipYaw = absX > absZ;
+        bool flipPitch = absY > absZ;
+
+        yawInput = FastAT(Math.Max(flipYaw ? (absZ / absX) : (absX / absZ), 0.00001));
+        pitchInput = FastAT(Math.Max(flipPitch ? (absZ / absY) : (absY / absZ), 0.00001));
+
+        if (flipYaw) yawInput = MathHelperD.PiOver2 - yawInput;
+        if (flipPitch) pitchInput = MathHelperD.PiOver2 - pitchInput;
+
+        if (TargetVector.Z > 0)
+        {
+            yawInput = (Math.PI - yawInput);
+            pitchInput = (Math.PI - pitchInput);
+        }
+    }
+
+    //---------- PID Controller Adjustment ----------
+    double DEF_PD_AIM_LIMIT = 6.3;
+
+    if (double.IsNaN(yawInput)) yawInput = 0;
+    if (double.IsNaN(pitchInput)) pitchInput = 0;
+
+    yawInput *= GetSign(TargetVector.X);
+    pitchInput *= GetSign(TargetVector.Y);
+
+    yawInput = mis.yawController.Filter(yawInput, 2);
+    pitchInput = mis.pitchController.Filter(pitchInput, 2);
+
+    if (Math.Abs(yawInput) + Math.Abs(pitchInput) > DEF_PD_AIM_LIMIT)
+    {
+        double adjust = DEF_PD_AIM_LIMIT / (Math.Abs(yawInput) + Math.Abs(pitchInput));
+        yawInput *= adjust;
+        pitchInput *= adjust;
+    }
+
+    //---------- Set Gyroscope Parameters ----------
+
+    mis.gyroControl.SetGyroYaw((float)yawInput);
+    mis.gyroControl.SetGyroPitch((float)pitchInput);
+    mis.gyroControl.SetGyroRoll(rollrpm);
+}
+
+
+
+
+
+void collectmissiles(List<IMyShipMergeBlock> mergeblocks)
+{
+    missilelist.Clear();
+    foreach (var merge in missilemergers)
+    {
+        missile missile = new missile();
+        missile.mergeblock = merge;
+        missile.launchtime = 0;
+        missile.launched = false;
+        bool validmissile = true;
+        missile.thrusters = new List<IMyThrust>();
+        missile.batterys = new List<IMyBatteryBlock>();
+        missile.gyros = new List<IMyGyro>();
+        missile.warheads = new List<IMyWarhead>();
+        //missile.remotes = new List<IMyShipController>();
+        missile.clustermerges = new List<IMyShipMergeBlock>();
+        missile.idletime = 0;
+
+        if (merge.CustomName.Contains("group") || merge.CustomName.Contains("idletime")) //try to get missile group, and idle time [ex: missilemerge 571|idletime 12|group 2|]
+        {
+            string[] customnamesplit = merge.CustomName.Split('|');
+            foreach (string splitname in customnamesplit)
+            {
+                if (splitname.Contains("group"))
+                {
+                    string tempstring = splitname;
+                    tempstring = splitname.Replace("group", "");
+                    tempstring = splitname.Replace(" ", "");
+                    int.TryParse(tempstring, out missile.missilegroup);
+                }
+                if (splitname.Contains("idletime"))
+                {
+                    string tempstring = splitname;
+                    tempstring = tempstring.Replace("idletime", "");
+                    tempstring = tempstring.Replace(" ", "");
+                    int.TryParse(tempstring, out missile.idletime);
+                }
+            }
+        }
+        else { missile.missilegroup = 0; }
+
+        string[] substrings = merge.CustomData.Split('|');
+        foreach (var sub in substrings)
+        {
+            if (sub.Length < 4)
+            {
+                continue;
+            }
+            string[] typeandcoords = sub.Split(':');
+            Vector3I coords = blocktogridrelative(merge, stringtocoords(typeandcoords[1]));
+            if (typeandcoords.Length == 2)
+            {
+                try
+                {
+                    if (typeandcoords[0] == "1")
+                    {
+                        var slim = merge.CubeGrid.GetCubeBlock(coords);
+                        if (slim == null) { continue; }
+                        IMyTerminalBlock block = slim.FatBlock as IMyTerminalBlock;
+                        if (!pbcubegrid_isblocknull(block))
+                            missile.thrusters.Add(block as IMyThrust);
+                    }
+                    if (typeandcoords[0] == "2")
+                    {
+                        var slim = merge.CubeGrid.GetCubeBlock(coords);
+                        if (slim == null) { continue; }
+                        IMyTerminalBlock block = slim.FatBlock as IMyTerminalBlock;
+                        if (!pbcubegrid_isblocknull(block))
+                            missile.batterys.Add(block as IMyBatteryBlock);
+                    }
+                    if (typeandcoords[0] == "3")
+                    {
+                        var slim = merge.CubeGrid.GetCubeBlock(coords);
+                        if (slim == null) { continue; }
+                        IMyTerminalBlock block = slim.FatBlock as IMyTerminalBlock;
+                        if (!pbcubegrid_isblocknull(block))
+                            missile.gyros.Add(block as IMyGyro);
+                    }
+                    if (typeandcoords[0] == "4")
+                    {
+                        var slim = merge.CubeGrid.GetCubeBlock(coords);
+                        if (slim == null) { continue; }
+                        IMyTerminalBlock block = slim.FatBlock as IMyTerminalBlock;
+                        if (!pbcubegrid_isblocknull(block))
+                            missile.warheads.Add(block as IMyWarhead);
+                    }
+                    /*
+                            if (typeandcoords[0] == "5")
+                            {
+                                IMyTerminalBlock block = merge.CubeGrid.GetCubeBlock(coords).FatBlock as IMyTerminalBlock;
+                                missile.remotes.Add(block as IMyShipController);
+                            }
+                            */
+                    if (typeandcoords[0] == "6")
+                    {
+                        var slim = merge.CubeGrid.GetCubeBlock(coords);
+                        if (slim == null) { continue; }
+                        IMyTerminalBlock block = slim.FatBlock as IMyTerminalBlock;
+                        if (!pbcubegrid_isblocknull(block))
+                            missile.clustermerges.Add(block as IMyShipMergeBlock);
+                    }
+                }
+                catch (Exception e)
+                {
+                    logerror("error in coll loop:" + e);
+                }
+            }
+        }
+        if (missile.thrusters.Count < 1 || missile.batterys.Count < 1 || missile.gyros.Count < 1)
+        {
+            validmissile = false;
+        }
+        if (validmissile) { missilelist.Add(missile); }
+    }
+}
+
+
+/* to implement,..
+        TYPE GetBlockAtCoordSafe<TYPE>(IMyShipMergeBlock merge, Vector3I coords) where TYPE : Sandbox.ModAPI.Ingame
+        {
+            var slim = merge.CubeGrid.GetCubeBlock(coords);
+            if (slim == null)
+                return default(TYPE);
+            TYPE block = slim.FatBlock as TYPE;
+            return block;
+        }
+        */
+
+
+Vector3I stringtocoords(string input)
+{
+    Vector3I result = Vector3I.Zero;
+    string[] temp = input.Split(',');
+    if (temp.Length == 3)
+    {
+        result.X = Convert.ToInt32(temp[0]);
+        result.Y = Convert.ToInt32(temp[1]);
+        result.Z = Convert.ToInt32(temp[2]);
+    }
+    return result;
+}
+
+
+Vector3I blocktogridrelative(IMyTerminalBlock reference, Vector3I offsetpos)
+{
+    Vector3I posdeltafwd = Base6Directions.GetIntVector(reference.Orientation.Forward);
+    Vector3I posdeltaleft = Base6Directions.GetIntVector(reference.Orientation.Left);
+    Vector3I posdeltaup = Base6Directions.GetIntVector(reference.Orientation.Up);
+    Vector3I result = new Vector3I();
+    if (posdeltafwd.Length() != 0)
+    {
+        if (posdeltafwd.X != 0)
+        {
+            result.X = offsetpos.X * posdeltafwd.X;
+        }
+        else if (posdeltafwd.Y != 0)
+        {
+            result.Y = offsetpos.X * posdeltafwd.Y;
+        }
+        else if (posdeltafwd.Z != 0)
+        {
+            result.Z = offsetpos.X * posdeltafwd.Z;
+        }
+    }
+    if (posdeltaleft.Length() != 0)
+    {
+        if (posdeltaleft.X != 0)
+        {
+            result.X = offsetpos.Y * posdeltaleft.X;
+        }
+        else if (posdeltaleft.Y != 0)
+        {
+            result.Y = offsetpos.Y * posdeltaleft.Y;
+        }
+        else if (posdeltaleft.Z != 0)
+        {
+            result.Z = offsetpos.Y * posdeltaleft.Z;
+        }
+    }
+    if (posdeltaup.Length() != 0)
+    {
+        if (posdeltaup.X != 0)
+        {
+            result.X = offsetpos.Z * posdeltaup.X;
+        }
+        else if (posdeltaup.Y != 0)
+        {
+            result.Y = offsetpos.Z * posdeltaup.Y;
+        }
+        else if (posdeltaup.Z != 0)
+        {
+            result.Z = offsetpos.Z * posdeltaup.Z;
+        }
+    }
+    return (reference.Position + result);
+}
+
+bool checkandupdatemissile(int index) //check and update a given missile in the missile list.
+{
+    if (!isblockfunctional(launchedmissiles[index].gyros[0], launchedmissiles[index].gyros[0])) { return false; } //check if gyro is operational. need to improve to handle multiple gyros
+
+    /*
+            for (int i = launchedmissiles[index].thrusters.Count - 1; i >= 0; i--)
+            {
+                if (!isblockfunctional(launchedmissiles[index].thrusters[i], launchedmissiles[index].gyros[0])) { launchedmissiles[index].thrusters.RemoveAt(i); } //check against gyros, because the merge block can be shot off
+            }
+            */
+    //thruster check seems to be broken.
+    for (int i = launchedmissiles[index].batterys.Count - 1; i >= 0; i--)
+    {
+        if (!isblockfunctional(launchedmissiles[index].batterys[i], launchedmissiles[index].gyros[0])) { launchedmissiles[index].batterys.RemoveAt(i); }
+    }
+    for (int i = launchedmissiles[index].gyros.Count - 1; i >= 0; i--)
+    {
+        if (!isblockfunctional(launchedmissiles[index].gyros[i], launchedmissiles[index].gyros[0])) { launchedmissiles[index].gyros.RemoveAt(i); }
+    }
+    /*
+            for (int i = launchedmissiles[index].remotes.Count - 1; i >= 0; i--)
+            {
+                if (!isblockfunctional(launchedmissiles[index].remotes[i], launchedmissiles[index].gyros[0])) { launchedmissiles[index].remotes.RemoveAt(i); }
+            }
+            */
+    if (launchedmissiles[index].thrusters.Count == 0 || launchedmissiles[index].batterys.Count == 0 || launchedmissiles[index].gyros.Count == 0)// || launchedmissiles[index].remotes.Count == 0)
+    {
+        logerror("missile removed because of: " + "thrusters: " + launchedmissiles[index].thrusters.Count + "batt: " + launchedmissiles[index].batterys.Count + "gyr: " + launchedmissiles[index].gyros.Count);
+        return true; //missile is fucked yo //TEMP WTF
+    }
+    return true;
+}
+
+
+void handlecluster(ref missile missile, double totalruntime, Vector3D targetpos)
+{
+    if (!cluster)
+        return;
+
+    if (missile.clustermerges.Count < 1)
+    {
+        rollrpm = 0;
+        return;
+    }
+    double disttotarget = (missile.currentposition - targetpos).Length();
+    if (missile.lastclusterdetach + cluster_detachdelay < totalruntime && disttotarget < cluster_detachrange)
+    {
+        for (int i = missile.clustermerges.Count - 1; i >= 0; i--)
+        {
+            if (isblockfunctional(missile.clustermerges[i], missile.gyros[0]))
+            {
+                missile.clustermerges[i].ApplyAction("OnOff_Off");
+
+                if (cluster_detachspin)
+                    rollrpm = detachspin_rpm;
+            }
+            missile.clustermerges.RemoveAt(i);
+            return;
+
+        }
+
+    }
+}
+
+Vector3D randomspray(double expansion_percentage) //halfextent multiplication for each direction. Accurate up to 2 decimals
+{
+    int exp_multiplied = Convert.ToInt32(100 * expansion_percentage); //multiply for ez rnd
+    //randomization is the max boundingbox size from center
+    Random random = new Random();
+    Vector3D result_multiplied = new Vector3D
+        (
+        (float)random.Next(-exp_multiplied, exp_multiplied),
+        (float)random.Next(-exp_multiplied, exp_multiplied),
+        (float)random.Next(-exp_multiplied, exp_multiplied)
+        );
+    return result_multiplied / 100;
+}
+Vector3D applyspray_boundingbox(Vector3D position, Vector3D randomization, BoundingBoxD boundingbox) //apply the spray of a specific missile to the enemy's position
+{
+    return new Vector3D
+        (
+        position.X + randomization.X * boundingbox.HalfExtents.X,
+        position.Y + randomization.Y * boundingbox.HalfExtents.Y,
+        position.Z + randomization.Z * boundingbox.HalfExtents.Z
+        );
+
+
+
+}
+
+
+void InitPIDControllers(ref missile missile) //partially from https://github.com/wellstat/SpaceEngineers/blob/master/IngameScripts/DiamondDomeDefense.cs
+{
+    const double DEF_SMALL_GRID_P = 31.42;
+    const double DEF_SMALL_GRID_I = 0;
+    const double DEF_SMALL_GRID_D = 10.48;
+
+    const double DEF_BIG_GRID_P = 15.71;
+    const double DEF_BIG_GRID_I = 0;
+    const double DEF_BIG_GRID_D = 7.05;
+
+    double AIM_P = 0;
+    double AIM_I = 0;
+    double AIM_D = 0;
+    double AIM_LIMIT = 6.3;
+
+    double INTEGRAL_WINDUP_UPPER_LIMIT = 0;
+    double INTEGRAL_WINDUP_LOWER_LIMIT = 0;
+    const float SECOND = 60f;
+    //---------- Setup PID Controller ----------
+
+    if (AIM_P + AIM_I + AIM_D < 0.001)
+    {
+
+        if (missile.gyros[0].CubeGrid.GridSizeEnum == MyCubeSize.Large)
+        {
+            AIM_P = DEF_BIG_GRID_P;
+            AIM_I = DEF_BIG_GRID_I;
+            AIM_D = DEF_BIG_GRID_D;
+        }
+        else
+        {
+            AIM_P = DEF_SMALL_GRID_P;
+            AIM_I = DEF_SMALL_GRID_I;
+            AIM_D = DEF_SMALL_GRID_D;
+            AIM_LIMIT *= 2;
+        }
+    }
+
+    missile.yawController = new PIDController(AIM_P, AIM_I, AIM_D, INTEGRAL_WINDUP_UPPER_LIMIT, INTEGRAL_WINDUP_LOWER_LIMIT, SECOND);
+    missile.pitchController = new PIDController(AIM_P, AIM_I, AIM_D, INTEGRAL_WINDUP_UPPER_LIMIT, INTEGRAL_WINDUP_LOWER_LIMIT, SECOND);
+    missile.rollController = new PIDController(AIM_P, AIM_I, AIM_D, INTEGRAL_WINDUP_UPPER_LIMIT, INTEGRAL_WINDUP_LOWER_LIMIT, SECOND);
+}
+
+public class PIDController //partially from https://github.com/wellstat/SpaceEngineers/blob/master/IngameScripts/DiamondDomeDefense.cs
+{
+    double integral;
+    double lastInput;
+
+    double gain_p;
+    double gain_i;
+    double gain_d;
+    double upperLimit_i;
+    double lowerLimit_i;
+    double second;
+
+    public PIDController(double pGain, double iGain, double dGain, double iUpperLimit = 0, double iLowerLimit = 0, float stepsPerSecond = 60f)
+    {
+        gain_p = pGain;
+        gain_i = iGain;
+        gain_d = dGain;
+        upperLimit_i = iUpperLimit;
+        lowerLimit_i = iLowerLimit;
+        second = stepsPerSecond;
+    }
+
+    public double Filter(double input, int round_d_digits)
+    {
+        double roundedInput = Math.Round(input, round_d_digits);
+
+        integral = integral + (input / second);
+        integral = (upperLimit_i > 0 && integral > upperLimit_i ? upperLimit_i : integral);
+        integral = (lowerLimit_i < 0 && integral < lowerLimit_i ? lowerLimit_i : integral);
+
+        double derivative = (roundedInput - lastInput) * second;
+        lastInput = roundedInput;
+
+        return (gain_p * input) + (gain_i * integral) + (gain_d * derivative);
+    }
+
+    public void Reset()
+    {
+        integral = lastInput = 0;
+    }
+}
+int GetMultiplierSign(double value)
+{
+    return (value < 0 ? -1 : 1);
+}
+public class GyroControl //partially from https://github.com/wellstat/SpaceEngineers/blob/master/IngameScripts/DiamondDomeDefense.cs
+{
+    Action<IMyGyro, float>[] profiles =
+    {
+        (g, v) => { g.Yaw = -v; },
+        (g, v) => { g.Yaw = v; },
+        (g, v) => { g.Pitch = -v; },
+        (g, v) => { g.Pitch = v; },
+        (g, v) => { g.Roll = -v; },
+        (g, v) => { g.Roll = v; }
+     };
+
+    List<IMyGyro> gyros;
+    byte[] gyroYaw;
+    byte[] gyroPitch;
+    byte[] gyroRoll;
+    int activeGyro = 0;
+    public GyroControl(List<IMyGyro> newGyros)
+    {
+        gyros = newGyros;
+    }
+    public void Init(ref MatrixD refWorldMatrix, IMyProgrammableBlock me)
+    {
+        if (gyros == null || gyros.Count < 1)
+        {
+            gyros = new List<IMyGyro>();
+        }
+        gyroYaw = new byte[gyros.Count];
+        gyroPitch = new byte[gyros.Count];
+        gyroRoll = new byte[gyros.Count];
+        for (int i = 0; i < gyros.Count; i++)
+        {
+            gyroYaw[i] = SetRelativeDirection(gyros[i].WorldMatrix.GetClosestDirection(refWorldMatrix.Up));
+            gyroPitch[i] = SetRelativeDirection(gyros[i].WorldMatrix.GetClosestDirection(refWorldMatrix.Left));
+            gyroRoll[i] = SetRelativeDirection(gyros[i].WorldMatrix.GetClosestDirection(refWorldMatrix.Forward));
+        }
+        activeGyro = 0;
+    }
+
+    public byte SetRelativeDirection(Base6Directions.Direction dir)
+    {
+        switch (dir)
+        {
+            case Base6Directions.Direction.Up:
+                return 1;
+            case Base6Directions.Direction.Down:
+                return 0;
+            case Base6Directions.Direction.Left:
+                return 2;
+            case Base6Directions.Direction.Right:
+                return 3;
+            case Base6Directions.Direction.Forward:
+                return 4;
+            case Base6Directions.Direction.Backward:
+                return 5;
+        }
+        return 0;
+    }
+    public void Enabled(bool enabled)
+    {
+        foreach (IMyGyro gyro in gyros)
+        {
+            gyro.Enabled = enabled;
+        }
+    }
+    public List<IMyGyro> getgyros()
+    {
+        return gyros;
+    }
+    public void SetGyroOverride(bool bOverride)
+    {
+        CheckGyro();
+        for (int i = 0; i < gyros.Count; i++)
+        {
+            if (i == activeGyro) gyros[i].GyroOverride = bOverride;
+            else gyros[i].GyroOverride = false;
+        }
+    }
+    public void SetGyroYaw(float yawRate)
+    {
+        CheckGyro();
+
+        if (activeGyro < gyros.Count)
+        {
+            profiles[gyroYaw[activeGyro]](gyros[activeGyro], yawRate);
+        }
+    }
+    public void SetGyroPitch(float pitchRate)
+    {
+        if (activeGyro < gyros.Count)
+        {
+            profiles[gyroPitch[activeGyro]](gyros[activeGyro], pitchRate);
+        }
+    }
+    public void SetGyroRoll(float rollRate)
+    {
+        if (activeGyro < gyros.Count)
+        {
+            profiles[gyroRoll[activeGyro]](gyros[activeGyro], rollRate);
+        }
+    }
+    public void ZeroTurnGyro()
+    {
+        for (int i = 0; i < gyros.Count; i++)
+        {
+            profiles[gyroYaw[i]](gyros[i], 0f);
+            profiles[gyroPitch[i]](gyros[i], 0f);
+        }
+    }
+    public void ResetGyro()
+    {
+        foreach (IMyGyro gyro in gyros)
+        {
+            gyro.Yaw = gyro.Pitch = gyro.Roll = 0f;
+        }
+    }
+    private void CheckGyro()
+    {
+        while (activeGyro < gyros.Count)
+        {
+            if (gyros[activeGyro].IsFunctional)
+            {
+                break;
+            }
+            else
+            {
+                IMyGyro gyro = gyros[activeGyro];
+
+                gyro.Enabled = gyro.GyroOverride = false;
+                gyro.Yaw = gyro.Pitch = gyro.Roll = 0f;
+
+                activeGyro++;
+            }
+        }
+    }
+}
+
+bool initgyro(ref missile missile)
+{
+    MatrixD refWorldMatrix = missile.batterys[0].WorldMatrix;
+    List<IMyGyro> gyros = missile.gyros;
+    missile.gyroControl = new GyroControl(gyros);
+    missile.gyroControl.Init(ref refWorldMatrix, Me);
+    missile.gyroControl.Enabled(true);
+    missile.gyroControl.SetGyroOverride(true);
+
+    return true;
+}
+
+
+
+
+bool gettarget(ref MyDetectedEntityInfo result)
+{
+    MyDetectedEntityInfo? focustarget = weaponapi.GetAiFocus(Me.EntityId);
+    if (focustarget.HasValue)
+    {
+        result = focustarget.Value;
+        return true;
+    }
+    return false;
+}
+
+
+
+public struct missile
+{
+    //missile parts
+    public IMyShipMergeBlock mergeblock;
+    public List<IMyThrust> thrusters;
+    public List<IMyBatteryBlock> batterys;
+    public List<IMyGyro> gyros;
+    public List<IMyWarhead> warheads;
+    //public List<IMyShipController> remotes; removed for starcore
+
+    //group data
+    public int missilegroup;
+
+    public bool launched;
+    public double launchtime;
+    public target target;
+    public double launchtime_real;
+    public int idletime;
+
+    public long explosiontickrnd;
+    public Vector3D sprayoffset;
+    public Vector3D starburstoffset;
+    public bool starburst_tripped;
+
+    //POSITIONDATA (because we dont use remote anymore)
+    public Vector3D currentposition;
+    public Vector3D previousposition;
+    public Vector3D velocity;
+
+    //Controller
+    public double lastinputyaw;
+    public double lastinputpitch;
+    public double lastinputroll;
+
+    public PIDController yawController;
+    public PIDController pitchController;
+    public PIDController rollController;
+    public GyroControl gyroControl;
+
+    //cluster detach
+    public double lastclusterdetach;
+    public List<IMyShipMergeBlock> clustermerges;
+
+    //alysius
+    public double lastSpeed;
+    public Vector3D lastTargetVelocity;
+    public Vector3D AccelerationVector;
+}
+
+
+bool pbcubegrid_isblocknull(IMyTerminalBlock block)
+{
+    if (block == null || Me.CubeGrid.GetCubeBlock(block.Position) == null)
+    {
+        return true;
+    }
+    return false;
+}
+
+bool isblocknull(IMyTerminalBlock block, IMyTerminalBlock reference)
+{
+    if (block == null || reference.CubeGrid.GetCubeBlock(block.Position) == null)
+    {
+        return true;
+    }
+    return false;
+}
+bool isblockfunctional(IMyTerminalBlock block, IMyTerminalBlock reference)
+{
+    if (!isblocknull(block, reference) && block.IsFunctional)
+    {
+        return true;
+    }
+    return false;
+}
+
+void refreshmergers() //refreshes all merge blocks on the grid, to check for possible msisile attachment points.
+{
+    GridTerminalSystem.GetBlocksOfType<IMyShipMergeBlock>(missilemergers, merge => merge.CustomName.ToLower().Contains(referenceblockname) && merge.IsFunctional);
+}
+
+//https://github.com/sstixrud/DefenseShields/blob/Production/Data/Scripts/DefenseShields/API/PbApiWrapper.cs
+//https://github.com/sstixrud/DefenseShields/blob/57a67400c1578723b1c0e7d7a8b3f7283501696b/Data/Scripts/DefenseShields/API/TapiBackend.cs#L755
+internal class PbApiWrapper
+{
+    private IMyTerminalBlock _block;
+
+    private readonly Func<IMyTerminalBlock, RayD, Vector3D?> _rayIntersectShield;
+    private readonly Func<IMyTerminalBlock, LineD, Vector3D?> _lineIntersectShield;
+    private readonly Func<IMyTerminalBlock, Vector3D, bool> _pointInShield;
+    private readonly Func<IMyTerminalBlock, float> _getShieldPercent;
+    private readonly Func<IMyTerminalBlock, int> _getShieldHeat;
+    private readonly Func<IMyTerminalBlock, float> _getChargeRate;
+    private readonly Func<IMyTerminalBlock, int> _hpToChargeRatio;
+    private readonly Func<IMyTerminalBlock, float> _getMaxCharge;
+    private readonly Func<IMyTerminalBlock, float> _getCharge;
+    private readonly Func<IMyTerminalBlock, float> _getPowerUsed;
+    private readonly Func<IMyTerminalBlock, float> _getPowerCap;
+    private readonly Func<IMyTerminalBlock, float> _getMaxHpCap;
+    private readonly Func<IMyTerminalBlock, bool> _isShieldUp;
+    private readonly Func<IMyTerminalBlock, string> _shieldStatus;
+    private readonly Func<IMyTerminalBlock, IMyEntity, bool, bool> _entityBypass;
+    private readonly Func<IMyCubeGrid, bool> _gridHasShield;
+    private readonly Func<IMyCubeGrid, bool> _gridShieldOnline;
+    private readonly Func<IMyEntity, bool> _protectedByShield;
+    private readonly Func<IMyEntity, IMyTerminalBlock> _getShieldBlock;
+    private readonly Func<IMyTerminalBlock, bool> _isShieldBlock;
+    private readonly Func<Vector3D, IMyTerminalBlock> _getClosestShield;
+    private readonly Func<IMyTerminalBlock, Vector3D, double> _getDistanceToShield;
+    private readonly Func<IMyTerminalBlock, Vector3D, Vector3D?> _getClosestShieldPoint;
+
+    public void SetActiveShield(IMyTerminalBlock block) => _block = block;
+
+    public PbApiWrapper(IMyTerminalBlock block)
+    {
+        _block = block;
+        var delegates = _block.GetProperty("DefenseSystemsPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(_block);
+        if (delegates == null) return;
+
+        _rayIntersectShield = (Func<IMyTerminalBlock, RayD, Vector3D?>)delegates["RayIntersectShield"];
+        _lineIntersectShield = (Func<IMyTerminalBlock, LineD, Vector3D?>)delegates["LineIntersectShield"];
+        _pointInShield = (Func<IMyTerminalBlock, Vector3D, bool>)delegates["PointInShield"];
+        _getShieldPercent = (Func<IMyTerminalBlock, float>)delegates["GetShieldPercent"];
+        _getShieldHeat = (Func<IMyTerminalBlock, int>)delegates["GetShieldHeat"];
+        _getChargeRate = (Func<IMyTerminalBlock, float>)delegates["GetChargeRate"];
+        _hpToChargeRatio = (Func<IMyTerminalBlock, int>)delegates["HpToChargeRatio"];
+        _getMaxCharge = (Func<IMyTerminalBlock, float>)delegates["GetMaxCharge"];
+        _getCharge = (Func<IMyTerminalBlock, float>)delegates["GetCharge"];
+        _getPowerUsed = (Func<IMyTerminalBlock, float>)delegates["GetPowerUsed"];
+        _getPowerCap = (Func<IMyTerminalBlock, float>)delegates["GetPowerCap"];
+        _getMaxHpCap = (Func<IMyTerminalBlock, float>)delegates["GetMaxHpCap"];
+        _isShieldUp = (Func<IMyTerminalBlock, bool>)delegates["IsShieldUp"];
+        _shieldStatus = (Func<IMyTerminalBlock, string>)delegates["ShieldStatus"];
+        _entityBypass = (Func<IMyTerminalBlock, IMyEntity, bool, bool>)delegates["EntityBypass"];
+        _gridHasShield = (Func<IMyCubeGrid, bool>)delegates["GridHasShield"];
+        _gridShieldOnline = (Func<IMyCubeGrid, bool>)delegates["GridShieldOnline"];
+        _protectedByShield = (Func<IMyEntity, bool>)delegates["ProtectedByShield"];
+        _getShieldBlock = (Func<IMyEntity, IMyTerminalBlock>)delegates["GetShieldBlock"];
+        _isShieldBlock = (Func<IMyTerminalBlock, bool>)delegates["IsShieldBlock"];
+        _getClosestShield = (Func<Vector3D, IMyTerminalBlock>)delegates["GetClosestShield"];
+        _getDistanceToShield = (Func<IMyTerminalBlock, Vector3D, double>)delegates["GetDistanceToShield"];
+        _getClosestShieldPoint = (Func<IMyTerminalBlock, Vector3D, Vector3D?>)delegates["GetClosestShieldPoint"];
+
+        if (!IsShieldBlock()) _block = GetShieldBlock(_block.CubeGrid) ?? _block;
+    }
+    public Vector3D? RayIntersectShield(RayD ray) => _rayIntersectShield?.Invoke(_block, ray) ?? null;
+    public Vector3D? LineIntersectShield(LineD line) => _lineIntersectShield?.Invoke(_block, line) ?? null;
+    public bool PointInShield(Vector3D pos) => _pointInShield?.Invoke(_block, pos) ?? false;
+    public float GetShieldPercent() => _getShieldPercent?.Invoke(_block) ?? -1;
+    public int GetShieldHeat() => _getShieldHeat?.Invoke(_block) ?? -1;
+    public float GetChargeRate() => _getChargeRate?.Invoke(_block) ?? -1;
+    public float HpToChargeRatio() => _hpToChargeRatio?.Invoke(_block) ?? -1;
+    public float GetMaxCharge() => _getMaxCharge?.Invoke(_block) ?? -1;
+    public float GetCharge() => _getCharge?.Invoke(_block) ?? -1;
+    public float GetPowerUsed() => _getPowerUsed?.Invoke(_block) ?? -1;
+    public float GetPowerCap() => _getPowerCap?.Invoke(_block) ?? -1;
+    public float GetMaxHpCap() => _getMaxHpCap?.Invoke(_block) ?? -1;
+    public bool IsShieldUp() => _isShieldUp?.Invoke(_block) ?? false;
+    public string ShieldStatus() => _shieldStatus?.Invoke(_block) ?? string.Empty;
+    public bool EntityBypass(IMyEntity entity, bool remove = false) => _entityBypass?.Invoke(_block, entity, remove) ?? false;
+    public bool GridHasShield(IMyCubeGrid grid) => _gridHasShield?.Invoke(grid) ?? false;
+    public bool GridShieldOnline(IMyCubeGrid grid) => _gridShieldOnline?.Invoke(grid) ?? false;
+    public bool ProtectedByShield(IMyEntity entity) => _protectedByShield?.Invoke(entity) ?? false;
+    public IMyTerminalBlock GetShieldBlock(IMyEntity entity) => _getShieldBlock?.Invoke(entity) ?? null;
+    public bool IsShieldBlock() => _isShieldBlock?.Invoke(_block) ?? false;
+    public IMyTerminalBlock GetClosestShield(Vector3D pos) => _getClosestShield?.Invoke(pos) ?? null;
+    public double GetDistanceToShield(Vector3D pos) => _getDistanceToShield?.Invoke(_block, pos) ?? -1;
+    public Vector3D? GetClosestShieldPoint(Vector3D pos) => _getClosestShieldPoint?.Invoke(_block, pos) ?? null;
+}
+
+
+//get the api from https://github.com/sstixrud/WeaponCore/blob/master/Data/Scripts/WeaponCore/Api/WeaponCorePbApi.cs
+public class WcPbApi
+{
+    private Action<ICollection<MyDefinitionId>> _getCoreWeapons;
+    private Action<ICollection<MyDefinitionId>> _getCoreStaticLaunchers;
+    private Action<ICollection<MyDefinitionId>> _getCoreTurrets;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<string, int>, bool> _getBlockWeaponMap;
+    private Func<long, MyTuple<bool, int, int>> _getProjectilesLockedOn;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float>> _getSortedThreats;
+    private Func<long, int, Sandbox.ModAPI.Ingame.MyDetectedEntityInfo> _getAiFocus;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _setAiFocus;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Sandbox.ModAPI.Ingame.MyDetectedEntityInfo> _getWeaponTarget;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int> _setWeaponTarget;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool, int> _fireWeaponOnce;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool, bool, int> _toggleWeaponFire;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, bool, bool, bool> _isWeaponReadyToFire;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, float> _getMaxWeaponRange;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, ICollection<string>, int, bool> _getTurretTargetTypes;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, ICollection<string>, int> _setTurretTargetTypes;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _setBlockTrackingRange;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _isTargetAligned;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, MyTuple<bool, Vector3D?>> _isTargetAlignedExtended;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, bool> _canShootTarget;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, int, Vector3D?> _getPredictedTargetPos;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _getHeatLevel;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, float> _currentPowerConsumption;
+    private Func<MyDefinitionId, float> _getMaxPower;
+    private Func<long, bool> _hasGridAi;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, bool> _hasCoreWeapon;
+    private Func<long, float> _getOptimalDps;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, string> _getActiveAmmo;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, string> _setActiveAmmo;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Action<long, int, ulong, long, Vector3D, bool>> _monitorProjectile;
+    private Action<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Action<long, int, ulong, long, Vector3D, bool>> _unMonitorProjectile;
+    private Func<ulong, MyTuple<Vector3D, Vector3D, float, float, long, string>> _getProjectileState;
+    private Func<long, float> _getConstructEffectiveDps;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long> _getPlayerController;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Matrix> _getWeaponAzimuthMatrix;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, Matrix> _getWeaponElevationMatrix;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, long, bool, bool, bool> _isTargetValid;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, int, MyTuple<Vector3D, Vector3D>> _getWeaponScope;
+    private Func<Sandbox.ModAPI.Ingame.IMyTerminalBlock, MyTuple<bool, bool>> _isInRange;
+
+    public bool Activate(Sandbox.ModAPI.Ingame.IMyTerminalBlock pbBlock)
+    {
+        var dict = pbBlock.GetProperty("WcPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(pbBlock);
+        if (dict == null) throw new Exception($"WcPbAPI failed to activate");
+        return ApiAssign(dict);
+    }
+
+    public bool ApiAssign(IReadOnlyDictionary<string, Delegate> delegates)
+    {
+        if (delegates == null)
+            return false;
+
+        AssignMethod(delegates, "GetCoreWeapons", ref _getCoreWeapons);
+        AssignMethod(delegates, "GetCoreStaticLaunchers", ref _getCoreStaticLaunchers);
+        AssignMethod(delegates, "GetCoreTurrets", ref _getCoreTurrets);
+        AssignMethod(delegates, "GetBlockWeaponMap", ref _getBlockWeaponMap);
+        AssignMethod(delegates, "GetProjectilesLockedOn", ref _getProjectilesLockedOn);
+        AssignMethod(delegates, "GetSortedThreats", ref _getSortedThreats);
+        AssignMethod(delegates, "GetAiFocus", ref _getAiFocus);
+        AssignMethod(delegates, "SetAiFocus", ref _setAiFocus);
+        AssignMethod(delegates, "GetWeaponTarget", ref _getWeaponTarget);
+        AssignMethod(delegates, "SetWeaponTarget", ref _setWeaponTarget);
+        AssignMethod(delegates, "FireWeaponOnce", ref _fireWeaponOnce);
+        AssignMethod(delegates, "ToggleWeaponFire", ref _toggleWeaponFire);
+        AssignMethod(delegates, "IsWeaponReadyToFire", ref _isWeaponReadyToFire);
+        AssignMethod(delegates, "GetMaxWeaponRange", ref _getMaxWeaponRange);
+        AssignMethod(delegates, "GetTurretTargetTypes", ref _getTurretTargetTypes);
+        AssignMethod(delegates, "SetTurretTargetTypes", ref _setTurretTargetTypes);
+        AssignMethod(delegates, "SetBlockTrackingRange", ref _setBlockTrackingRange);
+        AssignMethod(delegates, "IsTargetAligned", ref _isTargetAligned);
+        AssignMethod(delegates, "IsTargetAlignedExtended", ref _isTargetAlignedExtended);
+        AssignMethod(delegates, "CanShootTarget", ref _canShootTarget);
+        AssignMethod(delegates, "GetPredictedTargetPosition", ref _getPredictedTargetPos);
+        AssignMethod(delegates, "GetHeatLevel", ref _getHeatLevel);
+        AssignMethod(delegates, "GetCurrentPower", ref _currentPowerConsumption);
+        AssignMethod(delegates, "GetMaxPower", ref _getMaxPower);
+        AssignMethod(delegates, "HasGridAi", ref _hasGridAi);
+        AssignMethod(delegates, "HasCoreWeapon", ref _hasCoreWeapon);
+        AssignMethod(delegates, "GetOptimalDps", ref _getOptimalDps);
+        AssignMethod(delegates, "GetActiveAmmo", ref _getActiveAmmo);
+        AssignMethod(delegates, "SetActiveAmmo", ref _setActiveAmmo);
+        AssignMethod(delegates, "MonitorProjectile", ref _monitorProjectile);
+        AssignMethod(delegates, "UnMonitorProjectile", ref _unMonitorProjectile);
+        AssignMethod(delegates, "GetProjectileState", ref _getProjectileState);
+        AssignMethod(delegates, "GetConstructEffectiveDps", ref _getConstructEffectiveDps);
+        AssignMethod(delegates, "GetPlayerController", ref _getPlayerController);
+        AssignMethod(delegates, "GetWeaponAzimuthMatrix", ref _getWeaponAzimuthMatrix);
+        AssignMethod(delegates, "GetWeaponElevationMatrix", ref _getWeaponElevationMatrix);
+        AssignMethod(delegates, "IsTargetValid", ref _isTargetValid);
+        AssignMethod(delegates, "GetWeaponScope", ref _getWeaponScope);
+        AssignMethod(delegates, "IsInRange", ref _isInRange);
+        return true;
+    }
+
+    private void AssignMethod<T>(IReadOnlyDictionary<string, Delegate> delegates, string name, ref T field) where T : class
+    {
+        if (delegates == null)
+        {
+            field = null;
+            return;
+        }
+
+        Delegate del;
+        if (!delegates.TryGetValue(name, out del))
+            throw new Exception($"{GetType().Name} :: Couldn't find {name} delegate of type {typeof(T)}");
+
+        field = del as T;
+        if (field == null)
+            throw new Exception(
+                $"{GetType().Name} :: Delegate {name} is not type {typeof(T)}, instead it's: {del.GetType()}");
+    }
+
+    public void GetAllCoreWeapons(ICollection<MyDefinitionId> collection) => _getCoreWeapons?.Invoke(collection);
+
+    public void GetAllCoreStaticLaunchers(ICollection<MyDefinitionId> collection) =>
+        _getCoreStaticLaunchers?.Invoke(collection);
+
+    public void GetAllCoreTurrets(ICollection<MyDefinitionId> collection) => _getCoreTurrets?.Invoke(collection);
+
+    public bool GetBlockWeaponMap(Sandbox.ModAPI.Ingame.IMyTerminalBlock weaponBlock, IDictionary<string, int> collection) =>
+        _getBlockWeaponMap?.Invoke(weaponBlock, collection) ?? false;
+
+    public MyTuple<bool, int, int> GetProjectilesLockedOn(long victim) =>
+        _getProjectilesLockedOn?.Invoke(victim) ?? new MyTuple<bool, int, int>();
+
+    public void GetSortedThreats(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, IDictionary<Sandbox.ModAPI.Ingame.MyDetectedEntityInfo, float> collection) =>
+        _getSortedThreats?.Invoke(pBlock, collection);
+
+    public MyDetectedEntityInfo? GetAiFocus(long shooter, int priority = 0) => _getAiFocus?.Invoke(shooter, priority);
+
+    public bool SetAiFocus(Sandbox.ModAPI.Ingame.IMyTerminalBlock pBlock, long target, int priority = 0) =>
+        _setAiFocus?.Invoke(pBlock, target, priority) ?? false;
+
+    public MyDetectedEntityInfo? GetWeaponTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId = 0) =>
+        _getWeaponTarget?.Invoke(weapon, weaponId);
+
+    public void SetWeaponTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long target, int weaponId = 0) =>
+        _setWeaponTarget?.Invoke(weapon, target, weaponId);
+
+    public void FireWeaponOnce(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, bool allWeapons = true, int weaponId = 0) =>
+        _fireWeaponOnce?.Invoke(weapon, allWeapons, weaponId);
+
+    public void ToggleWeaponFire(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, bool on, bool allWeapons, int weaponId = 0) =>
+        _toggleWeaponFire?.Invoke(weapon, on, allWeapons, weaponId);
+
+    public bool IsWeaponReadyToFire(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId = 0, bool anyWeaponReady = true,
+        bool shootReady = false) =>
+        _isWeaponReadyToFire?.Invoke(weapon, weaponId, anyWeaponReady, shootReady) ?? false;
+
+    public float GetMaxWeaponRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getMaxWeaponRange?.Invoke(weapon, weaponId) ?? 0f;
+
+    public bool GetTurretTargetTypes(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, IList<string> collection, int weaponId = 0) =>
+        _getTurretTargetTypes?.Invoke(weapon, collection, weaponId) ?? false;
+
+    public void SetTurretTargetTypes(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, IList<string> collection, int weaponId = 0) =>
+        _setTurretTargetTypes?.Invoke(weapon, collection, weaponId);
+
+    public void SetBlockTrackingRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, float range) =>
+        _setBlockTrackingRange?.Invoke(weapon, range);
+
+    public bool IsTargetAligned(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _isTargetAligned?.Invoke(weapon, targetEnt, weaponId) ?? false;
+
+    public MyTuple<bool, Vector3D?> IsTargetAlignedExtended(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _isTargetAlignedExtended?.Invoke(weapon, targetEnt, weaponId) ?? new MyTuple<bool, Vector3D?>();
+
+    public bool CanShootTarget(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _canShootTarget?.Invoke(weapon, targetEnt, weaponId) ?? false;
+
+    public Vector3D? GetPredictedTargetPosition(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetEnt, int weaponId) =>
+        _getPredictedTargetPos?.Invoke(weapon, targetEnt, weaponId) ?? null;
+
+    public float GetHeatLevel(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _getHeatLevel?.Invoke(weapon) ?? 0f;
+    public float GetCurrentPower(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _currentPowerConsumption?.Invoke(weapon) ?? 0f;
+    public float GetMaxPower(MyDefinitionId weaponDef) => _getMaxPower?.Invoke(weaponDef) ?? 0f;
+    public bool HasGridAi(long entity) => _hasGridAi?.Invoke(entity) ?? false;
+    public bool HasCoreWeapon(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _hasCoreWeapon?.Invoke(weapon) ?? false;
+    public float GetOptimalDps(long entity) => _getOptimalDps?.Invoke(entity) ?? 0f;
+
+    public string GetActiveAmmo(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getActiveAmmo?.Invoke(weapon, weaponId) ?? null;
+
+    public void SetActiveAmmo(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, string ammoType) =>
+        _setActiveAmmo?.Invoke(weapon, weaponId, ammoType);
+
+    public void MonitorProjectileCallback(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, Action<long, int, ulong, long, Vector3D, bool> action) =>
+        _monitorProjectile?.Invoke(weapon, weaponId, action);
+
+    public void UnMonitorProjectileCallback(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId, Action<long, int, ulong, long, Vector3D, bool> action) =>
+        _unMonitorProjectile?.Invoke(weapon, weaponId, action);
+
+    public MyTuple<Vector3D, Vector3D, float, float, long, string> GetProjectileState(ulong projectileId) =>
+        _getProjectileState?.Invoke(projectileId) ?? new MyTuple<Vector3D, Vector3D, float, float, long, string>();
+
+    public float GetConstructEffectiveDps(long entity) => _getConstructEffectiveDps?.Invoke(entity) ?? 0f;
+
+    public long GetPlayerController(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon) => _getPlayerController?.Invoke(weapon) ?? -1;
+
+    public Matrix GetWeaponAzimuthMatrix(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponAzimuthMatrix?.Invoke(weapon, weaponId) ?? Matrix.Zero;
+
+    public Matrix GetWeaponElevationMatrix(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponElevationMatrix?.Invoke(weapon, weaponId) ?? Matrix.Zero;
+
+    public bool IsTargetValid(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, long targetId, bool onlyThreats, bool checkRelations) =>
+        _isTargetValid?.Invoke(weapon, targetId, onlyThreats, checkRelations) ?? false;
+
+    public MyTuple<Vector3D, Vector3D> GetWeaponScope(Sandbox.ModAPI.Ingame.IMyTerminalBlock weapon, int weaponId) =>
+        _getWeaponScope?.Invoke(weapon, weaponId) ?? new MyTuple<Vector3D, Vector3D>();
+    // terminalBlock, Threat, Other, Something
+    public MyTuple<bool, bool> IsInRange(Sandbox.ModAPI.Ingame.IMyTerminalBlock block) =>
+        _isInRange?.Invoke(block) ?? new MyTuple<bool, bool>();
+
+}

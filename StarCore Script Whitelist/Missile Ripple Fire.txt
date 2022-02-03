@@ -1,0 +1,172 @@
+//Original: https://steamcommunity.com/sharedfiles/filedetails/?id=2465291190
+
+/*
+ * R e a d m e
+ * -----------
+ * Example Custom Data and firing order
+ * 
+ * 5
+ * 0
+ * 100
+ * M-8 Destroyer Launcher
+ * M-8 Destroyer Launcher 2
+ */
+
+// Go to:
+// https://github.com/malware-dev/MDK-SE/wiki/Quick-Introduction-to-Space-Engineers-Ingame-Scripts
+//
+// to learn more about ingame scripts.
+
+public static WcPbApi api;
+MyIni _ini = new MyIni();
+int interval = 0;
+int count = 0;
+int barrage = 0;
+
+public Program()
+{
+    //Runtime.UpdateFrequency = UpdateFrequency.Update1;
+    Configure();
+}
+
+public void Save()
+{
+    Storage = string.Join(";",
+    interval.ToString(),
+    count.ToString(),
+    barrage.ToString()
+    );
+}
+
+public void Load()
+{
+    string[] storedData = Storage.Split(';');
+    //get the count and firing interval
+    int.TryParse(storedData[0], out interval);
+    int.TryParse(storedData[1], out count);
+    int.TryParse(storedData[2], out barrage);
+}
+
+public void Configure()
+{
+    //split the custom data string
+    var temp = Me.CustomData.Split('\n');
+    int.TryParse(temp[0], out interval);
+    int.TryParse(temp[1], out count);
+    int.TryParse(temp[2], out barrage);
+}
+
+public void Fire(int weapon)
+{
+    //get the specified weapon from the config and set fire to on
+    var temp = Me.CustomData.Split('\n');
+    string weaponName = temp[weapon + 3];
+    IMyTerminalBlock thisWeapon = GridTerminalSystem.GetBlockWithName(weaponName) as IMyTerminalBlock;
+    api.ToggleWeaponFire(thisWeapon, true, false);
+    Echo(weaponName);
+}
+
+public void Reset()
+{
+    //go through the list of weapons and set each to fire = false
+    var temp = Me.CustomData.Split('\n');
+    foreach(string weapon in temp)
+    {
+        try
+        {
+            IMyTerminalBlock thisWeapon = GridTerminalSystem.GetBlockWithName(weapon) as IMyTerminalBlock;
+            api.ToggleWeaponFire(thisWeapon, false, false);
+        }
+        catch (Exception asdf) { continue; }
+    }
+    //turn off autorun
+    Runtime.UpdateFrequency = UpdateFrequency.None;
+    //Reset Count
+    count = -1;
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    api = new WcPbApi();
+    try
+    {
+        api.Activate(Me);
+    }
+    catch
+    {
+        Echo("WeaponCore Api is failing! \n Make sure WeaponCore is enabled!"); return;
+    }
+
+    //load storage string
+    try
+    {
+        Load();
+    }
+    catch(Exception asdf)
+    {
+        Configure();
+    }
+    Echo(count.ToString());
+    //if this is the first tick, fire weapon 0
+    if(count == 0) {
+        Fire(0);
+        Runtime.UpdateFrequency = UpdateFrequency.Update10;
+        Configure();
+    }
+    else if(count % interval == 0)
+    {
+        try
+        {
+            Fire(count / interval);
+        }
+        catch (Exception asdf)
+        {
+
+        }
+    }
+    if (count > barrage) {
+        Reset();
+        Echo("DING!");
+    }
+    count++;
+    Save();
+}
+
+}
+
+public class WcPbApi
+{
+    private Action<IMyTerminalBlock, bool, bool, int> _toggleWeaponFire;
+
+    public bool Activate(IMyTerminalBlock pbBlock)
+    {
+        var dict = pbBlock.GetProperty("WcPbAPI")?.As<Dictionary<string, Delegate>>().GetValue(pbBlock);
+        if (dict == null) throw new Exception($"WcPbAPI failed to activate");
+        return ApiAssign(dict);
+    }
+
+    public bool ApiAssign(IReadOnlyDictionary<string, Delegate> delegates)
+    {
+        if (delegates == null)
+            return false;
+        AssignMethod(delegates, "ToggleWeaponFire", ref _toggleWeaponFire);
+        return true;
+    }
+
+    private void AssignMethod<T>(IReadOnlyDictionary<string, Delegate> delegates, string name, ref T field) where T : class
+    {
+        if (delegates == null)
+        {
+            field = null;
+            return;
+        }
+        Delegate del;
+        if (!delegates.TryGetValue(name, out del))
+            throw new Exception($"{GetType().Name} :: Couldn't find {name} delegate of type {typeof(T)}");
+        field = del as T;
+        if (field == null)
+            throw new Exception(
+                $"{GetType().Name} :: Delegate {name} is not type {typeof(T)}, instead it's: {del.GetType()}");
+    }
+    public void ToggleWeaponFire(IMyTerminalBlock weapon, bool on, bool allWeapons, int weaponId = 0) =>
+        _toggleWeaponFire?.Invoke(weapon, on, allWeapons, weaponId);
