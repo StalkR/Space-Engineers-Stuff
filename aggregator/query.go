@@ -38,11 +38,13 @@ func query(host string) error {
 }
 
 func queryInfo(host string) (*ServerInfo, error) {
-  conn, err := net.DialTimeout("udp", host, time.Second)
+  const timeout = 5 * time.Second
+  conn, err := net.DialTimeout("udp", host, timeout)
   if err != nil {
     return nil, err
   }
   defer conn.Close()
+  conn.SetReadDeadline(time.Now().Add(timeout))
 
   if _, err := conn.Write(INFO_Request(0)); err != nil {
     return nil, err
