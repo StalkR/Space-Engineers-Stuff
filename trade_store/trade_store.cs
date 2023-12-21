@@ -1,4 +1,7 @@
-// Simple trade store.
+// Simple automatic trade store.
+// It watches the container every 100 ticks and as soon as
+// there's enough for a given trade, executes it: moving item
+// from input to storage, then from storage to output.
 
 public Program()
 {
