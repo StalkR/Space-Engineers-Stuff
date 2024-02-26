@@ -2,7 +2,10 @@ package main
 
 import (
   "fmt"
+  "log"
   "net"
+  "sort"
+  "strings"
   "time"
 )
 
@@ -11,34 +14,43 @@ func query(host string) error {
   if err != nil {
     return err
   }
-  fmt.Printf("     Server: %v\n", info.Name)
-  fmt.Printf("        Map: %v\n", info.MapName)
-  fmt.Printf("     Folder: %v\n", info.Folder)
-  fmt.Printf("       Game: %v\n", info.Game)
-  fmt.Printf("      AppID: %v\n", info.AppID)
-  fmt.Printf("    Players: %v\n", info.Players)
-  fmt.Printf(" MaxPlayers: %v\n", info.MaxPlayers)
-  fmt.Printf("       Bots: %v\n", info.Bots)
-  fmt.Printf("       Type: %c\n", info.ServerType)
-  fmt.Printf("Environment: %c\n", info.Environment)
-  fmt.Printf(" Visibility: %v\n", info.Visibility)
-  fmt.Printf("        VAC: %v\n", info.VAC)
-  fmt.Printf("    Version: %v\n", info.Version)
-  fmt.Printf("        EDF: %v\n", info.EDF)
-
   players, err := queryPlayers(host)
   if err != nil {
     return err
   }
-  fmt.Printf("    Players: %v\n", len(players))
-  for _, p := range players {
-    fmt.Printf(" - %v (score: %v, since: %v)\n", p.Name, p.Score, time.Duration(p.Duration)*time.Second)
+  if *flagLog {
+    var playerNames []string
+    for _, p := range players {
+      playerNames = append(playerNames, p.Name)
+    }
+    sort.Strings(playerNames)
+    log.Printf("%v (%v): %v", info.Name, info.Players, strings.Join(playerNames, ", "))
+  } else {
+    fmt.Printf("      Server: %v\n", info.Name)
+    fmt.Printf("         Map: %v\n", info.MapName)
+    fmt.Printf("      Folder: %v\n", info.Folder)
+    fmt.Printf("        Game: %v\n", info.Game)
+    fmt.Printf("       AppID: %v\n", info.AppID)
+    fmt.Printf("     Players: %v\n", info.Players)
+    fmt.Printf("  MaxPlayers: %v\n", info.MaxPlayers)
+    fmt.Printf("        Bots: %v\n", info.Bots)
+    fmt.Printf("        Type: %c\n", info.ServerType)
+    fmt.Printf(" Environment: %c\n", info.Environment)
+    fmt.Printf("  Visibility: %v\n", info.Visibility)
+    fmt.Printf("         VAC: %v\n", info.VAC)
+    fmt.Printf("     Version: %v\n", info.Version)
+    fmt.Printf("         EDF: %v\n", info.EDF)
+    fmt.Printf("Player names: %v\n", len(players))
+    for _, p := range players {
+      fmt.Printf(" - %v (score: %v, since: %v)\n", p.Name, p.Score, time.Duration(p.Duration)*time.Second)
+    }
   }
   return nil
 }
 
+const timeout = 5 * time.Second
+
 func queryInfo(host string) (*ServerInfo, error) {
-  const timeout = 5 * time.Second
   conn, err := net.DialTimeout("udp", host, timeout)
   if err != nil {
     return nil, err

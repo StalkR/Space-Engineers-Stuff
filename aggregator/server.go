@@ -54,10 +54,11 @@ func (s *Server) handle(conn net.PacketConn) error {
 		if payload != A2S_INFO_PAYLOAD {
 			return fmt.Errorf("[%v] invalid payload: got %v want %v", addr, payload, A2S_INFO_PAYLOAD)
 		}
-		info := s.data.Info()
-		log.Printf("[%v] info query: %v players", addr, info.Players)
-		if _, err := conn.WriteTo(info.Bytes(), addr); err != nil {
-			return fmt.Errorf("[%v] write info: %v", addr, err)
+		if info := s.data.Info(); info != nil {
+			log.Printf("[%v] info query: %v players", addr, info.Players)
+			if _, err := conn.WriteTo(info.Bytes(), addr); err != nil {
+				return fmt.Errorf("[%v] write info: %v", addr, err)
+			}
 		}
 		return nil
 
