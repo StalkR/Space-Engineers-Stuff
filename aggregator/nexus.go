@@ -5,6 +5,7 @@ import (
   "fmt"
   "log"
   "os"
+  "reflect"
   "time"
 )
 
@@ -34,6 +35,17 @@ func (s *NexusAggregator) WatchConfig(sleep time.Duration) {
       log.Printf("could not read nexus config: %v", err)
       continue
     }
+    if len(servers) == 0 {
+      log.Print("invalid nexus config: no servers")
+      continue
+    }
+    s.m.Lock()
+    oldServers := s.servers
+    s.m.Unlock()
+    if reflect.DeepEqual(servers, oldServers) {
+      continue
+    }
+    log.Printf("nexus config changed: before %v (%v), after %v (%v)", len(oldServers), oldServers, len(servers), servers)
     s.m.Lock()
     s.servers = servers
     s.m.Unlock()

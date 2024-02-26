@@ -28,7 +28,10 @@ func NewAggregator(servers string) (*Aggregator, error) {
 
 func (s *Aggregator) Aggregate(sleep time.Duration) {
 	for ; ; time.Sleep(sleep) {
-		for _, server := range s.servers {
+		s.m.Lock()
+		servers := s.servers
+		s.m.Unlock()
+		for _, server := range servers {
 			info, err := queryInfo(server)
 			if err != nil {
 				log.Printf("query %v error: %v", server, err)
