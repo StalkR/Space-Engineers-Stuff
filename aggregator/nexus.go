@@ -19,6 +19,10 @@ func NewNexusAggregator(config string) (*NexusAggregator, error) {
   if err != nil {
     return nil, err
   }
+  if len(servers) == 0 {
+    return nil, fmt.Errorf("invalid nexus config: no servers")
+  }
+  log.Printf("servers in nexus config (%v): %v", len(servers), servers)
   return &NexusAggregator{
     config: config,
     Aggregator: Aggregator{

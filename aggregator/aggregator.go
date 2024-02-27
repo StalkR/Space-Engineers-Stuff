@@ -48,10 +48,11 @@ func (s *Aggregator) Aggregate(sleep time.Duration) {
 func (s *Aggregator) Info() *ServerInfo {
 	s.m.Lock()
 	defer s.m.Unlock()
-	aggregate, ok := s.infos[s.servers[0]]
-	if !ok {
+	first := s.infos[s.servers[0]]
+	if first == nil {
 		return nil
 	}
+	aggregate := *first
 	totalPlayers := 0
 	for _, info := range s.infos {
 		totalPlayers += int(info.Players)
@@ -63,7 +64,7 @@ func (s *Aggregator) Info() *ServerInfo {
 	if aggregate.MaxPlayers < aggregate.Players {
 		aggregate.MaxPlayers = aggregate.Players
 	}
-	return aggregate
+	return &aggregate
 }
 
 func (s *Aggregator) Players() ServerPlayers {
