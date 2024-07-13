@@ -57,5 +57,35 @@ func handleFactions() error {
 		factionless = append(factionless, playerNames[id])
 	}
 	fmt.Printf("Players without faction (%v): %v\n", len(factionless), strings.Join(factionless, ", "))
+
+	reputations := map[int64]map[int64]int{}
+	for _, r := range v.Relations {
+		if v, ok := reputations[r.FactionId1]; ok {
+			if _, ok := v[r.FactionId2]; ok {
+				fmt.Printf("error: duplicate faction relation for %v (%v) and %v (%v)\n",
+					r.FactionId1, factionTags[r.FactionId1], r.FactionId2, factionTags[r.FactionId2])
+			}
+		} else {
+			reputations[r.FactionId1] = map[int64]int{}
+		}
+		reputations[r.FactionId1][r.FactionId2] = r.Reputation
+
+		if v, ok := reputations[r.FactionId2]; ok {
+			if _, ok := v[r.FactionId1]; ok {
+				fmt.Printf("error: duplicate faction relation for %v (%v) and %v (%v)\n",
+					r.FactionId2, factionTags[r.FactionId2], r.FactionId1, factionTags[r.FactionId1])
+			}
+		} else {
+			reputations[r.FactionId2] = map[int64]int{}
+		}
+		reputations[r.FactionId2][r.FactionId1] = r.Reputation
+	}
+
+	fmt.Printf("Reputations (%v / %v):\n", len(v.Relations), len(reputations))
+	for f1, r := range reputations {
+		for f2, reputation := range r {
+			fmt.Printf("- %v/%v: %v\n", factionTags[f1], factionTags[f2], reputation)
+		}
+	}
 	return nil
 }
