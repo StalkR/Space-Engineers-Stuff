@@ -148,7 +148,15 @@ public bool move(IMyInventory src, IMyInventory dst, long n, string name)
   items.Clear();
   src.GetItems(items, e => itemName(e) == name);
   if (items.Count() == 0) return false;
-  return src.TransferItemTo(dst, items[0], (int)n);
+  int remaining = (int)n;
+  foreach (var item in items)
+  {
+    int amount = Math.Min(remaining, (int)float.Parse(item.Amount.ToString()));
+    if (!src.TransferItemTo(dst, item, amount)) return false;
+    remaining = remaining - amount;
+    if (remaining == 0) break;
+  }
+  return true;
 }
 
 public int IndexOf(StringBuilder sb, string value, int startIndex = 0)
