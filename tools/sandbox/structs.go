@@ -1,10 +1,11 @@
 package main
 
 type MyObjectBuilder_Checkpoint struct {
-	Factions   []MyObjectBuilder_Faction         `xml:"Factions>Factions>MyObjectBuilder_Faction"`
-	Players    []item                            `xml:"Factions>Players>dictionary>item"`
-	Relations  []MyObjectBuilder_FactionRelation `xml:"Factions>Relations>MyObjectBuilder_FactionRelation"`
-	Identities []MyObjectBuilder_Identity        `xml:"Identities>MyObjectBuilder_Identity"`
+	Factions       []MyObjectBuilder_Faction         `xml:"Factions>Factions>MyObjectBuilder_Faction"`
+	Players        []item                            `xml:"Factions>Players>dictionary>item"`
+	Relations      []MyObjectBuilder_FactionRelation `xml:"Factions>Relations>MyObjectBuilder_FactionRelation"`
+	Identities     []MyObjectBuilder_Identity        `xml:"Identities>MyObjectBuilder_Identity"`
+	AllPlayersData []AllPlayersData                  `xml:"AllPlayersData>dictionary>item"`
 }
 
 type MyObjectBuilder_Faction struct {
@@ -37,4 +38,20 @@ type MyObjectBuilder_Identity struct {
 type item struct {
 	Key   int64 `xml:"Key"`
 	Value int64 `xml:"Value"`
+}
+
+type AllPlayersData struct {
+	Value AllPlayersDataValue `xml:"Value"`
+}
+
+type AllPlayersDataValue struct {
+	DisplayName          string `xml:"DisplayName"`
+	IdentityId           int64  `xml:"IdentityId"`
+	Connected            bool   `xml:"Connected"`
+	ForceRealPlayer      bool   `xml:"ForceRealPlayer"`
+	CreativeToolsEnabled bool   `xml:"CreativeToolsEnabled"`
+	RemoteAdminSettings  int    `xml:"RemoteAdminSettings"`
+	PromoteLevel         string `xml:"PromoteLevel"`
+	BuildColorSlot       int    `xml:"BuildColorSlot"`
+	IsWildlifeAgent      bool   `xml:"IsWildlifeAgent"`
 }
