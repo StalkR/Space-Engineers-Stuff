@@ -21,7 +21,6 @@ func parsePlayersFile(filename string) error {
     return err
   }
 
-  identityIDToSteamID := map[int64]int64{}
   for _, p := range v {
     identityIDToSteamID[p.IdentityID] = p.SteamID
     playerNameToSteamID[p.Player] = p.SteamID
