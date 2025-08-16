@@ -58,37 +58,71 @@ func (s *NexusAggregator) WatchConfig(sleep time.Duration) {
 }
 
 func parseNexusConfigFile(config string) ([]string, error) {
+  servers, err1 := parseNexus1ConfigFile(config)
+  if err1 == nil {
+    return servers, nil
+  }
+  servers, err3 := parseNexus3ConfigFile(config)
+  if err3 != nil {
+    return nil, fmt.Errorf("error loading as nexus1: %v\nerror as nexus3: %v", err1, err3)
+  }
+  return servers, nil
+}
+
+func parseNexus1ConfigFile(config string) ([]string, error) {
   f, err := os.Open(config)
   if err != nil {
     return nil, err
   }
   defer f.Close()
-  var v nexusConfig
+  var v struct {
+    XMLName           xml.Name `xml:"Config"`
+    ConfiguredServers struct {
+      XMLName xml.Name `xml:"ConfiguredServers"`
+      Server  []struct {
+        XMLName   xml.Name `xml:"Server"`
+        Name      string   `xml:"Name"`
+        IPAddress string   `xml:"IPAddress"`
+        Port      string   `xml:"Port"`
+      } `xml:"Server"`
+    } `xml:"ConfiguredServers"`
+  }
   if err := xml.NewDecoder(f).Decode(&v); err != nil {
     return nil, err
   }
-  return parseNexusConfig(&v)
-}
-
-func parseNexusConfig(cfg *nexusConfig) ([]string, error) {
   var servers []string
-  for _, e := range cfg.ConfiguredServers.Server {
+  for _, e := range v.ConfiguredServers.Server {
     servers = append(servers, fmt.Sprintf("%s:%s", e.IPAddress, e.Port))
   }
   return servers, nil
 }
 
-type nexusConfig struct {
-  XMLName           xml.Name `xml:"Config"`
-  ConfiguredServers struct {
-    XMLName xml.Name `xml:"ConfiguredServers"`
-    Server  []struct {
-      XMLName   xml.Name `xml:"Server"`
-      Name      string   `xml:"Name"`
-      IPAddress string   `xml:"IPAddress"`
-      Port      string   `xml:"Port"`
-    } `xml:"Server"`
-  } `xml:"ConfiguredServers"`
+func parseNexus3ConfigFile(config string) ([]string, error) {
+  f, err := os.Open(config)
+  if err != nil {
+    return nil, err
+  }
+  defer f.Close()
+  var v struct {
+    XMLName           xml.Name `xml:"BaseConfig"`
+    ConfiguredServers struct {
+      XMLName xml.Name `xml:"ConfiguredServers"`
+      Server  []struct {
+        XMLName       xml.Name `xml:"Server"`
+        Name          string   `xml:"Name"`
+        GameIPAddress string   `xml:"GameIPAddress"`
+        GamePort      string   `xml:"GamePort"`
+      } `xml:"Server"`
+    } `xml:"ConfiguredServers"`
+  }
+  if err := xml.NewDecoder(f).Decode(&v); err != nil {
+    return nil, err
+  }
+  var servers []string
+  for _, e := range v.ConfiguredServers.Server {
+    servers = append(servers, fmt.Sprintf("%s:%s", e.GameIPAddress, e.GamePort))
+  }
+  return servers, nil
 }
 
 // cleanup cleans up the infos map.
